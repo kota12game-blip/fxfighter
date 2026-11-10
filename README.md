@@ -4,7 +4,7 @@
 
 1. https://twelvedata.com でアカウント作成（無料）
 2. ダッシュボードの API Keys からキーをコピー
-b0aa49a32be74b0092d981b8073a4153
+
 
 ## 2\. Supabase（ログイン・保存・フレンド）
 
