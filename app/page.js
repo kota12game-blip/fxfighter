@@ -10,6 +10,10 @@ const yen = n => (n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleStr
 const sgn = n => (n > 0 ? '+' : n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
 const cl = n => (n > 0 ? 'up' : n < 0 ? 'dn' : '');
 const today = () => new Date().toLocaleDateString('sv-SE');
+const copyText = async t => {
+  try { await navigator.clipboard.writeText(t); return true; } catch {}
+  try { const a = document.createElement('textarea'); a.value = t; a.style.position = 'fixed'; a.style.opacity = '0'; document.body.appendChild(a); a.focus(); a.select(); const ok = document.execCommand('copy'); a.remove(); return ok; } catch { return false; }
+};
 const TITLES = [['見習いトレーダー', 30000], ['相場の旅人', 100000], ['ドル円職人', 300000], ['円安の覇者', 1000000]];
 const ICONS = [['🐣', 10000], ['🦊', 50000], ['🐺', 150000], ['🦁', 400000], ['🐉', 1000000]];
 const GUARD_PRICE = 60000, GUARD_MAX = 3;
@@ -285,7 +289,7 @@ export default function App() {
   const link = async () => { const { error } = await supabase.auth.linkIdentity({ provider: 'google', options: { redirectTo: location.origin } }); if (error) toast('連携に失敗: ' + error.message); };
   const saveName = async () => { const n = nm.trim(); if (!n) return; await supabase.from('profiles').update({ name: n }).eq('id', user.id); setProfile({ ...profile, name: n }); toast('名前を変更しました'); };
   const invite = profile ? location.origin + '/?f=' + profile.code : '';
-  const copy = async () => { try { await navigator.clipboard.writeText(invite); toast('招待リンクをコピーしました'); } catch { toast(invite); } };
+  const copy = async () => { toast((await copyText(invite)) ? '招待リンクをコピーしました' : 'コピーできません。下のリンクを長押ししてコピーしてください'); };
   if (!user) return (<main style={{ paddingTop: 50, textAlign: 'center' }}><h1>VIRTUAL MARKET</h1><p className="sm">本物のドル円の価格で遊べる仮想トレード</p>
     <div className="card"><input value={gname} onChange={e => setGname(e.target.value)} placeholder="ニックネーム" maxLength={12} /><button className="btn" style={{ marginTop: 8, width: '100%' }} onClick={guest}>ゲストで始める</button>
       <p className="sm">登録不要。データはこの端末に紐づいて保存されます。あとからGoogleと連携すれば、他の端末でも続けられます。</p></div>
@@ -365,7 +369,7 @@ export default function App() {
             {(() => { const x = groups.find(y => y.id === gsel); return x && <div className="sm" style={{ marginBottom: 8 }}>グループコード：<b>{x.code}</b></div>; })()}
             {gboard.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.eq : r.equity)}</b></div>)}
             <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
-              <button className="btn g" onClick={async () => { const x = groups.find(y => y.id === gsel); if (!x) return; const l = location.origin + '/?g=' + x.code; try { await navigator.clipboard.writeText(l); toast('グループ招待リンクをコピーしました'); } catch { toast(l); } }}>招待リンクをコピー</button>
+              <button className="btn g" onClick={async () => { const x = groups.find(y => y.id === gsel); if (!x) return; const l = location.origin + '/?g=' + x.code; toast((await copyText(l)) ? 'グループ招待リンクをコピーしました' : 'コピーできません：' + l); }}>招待リンクをコピー</button>
               <button className="btn g" onClick={() => leaveGroup(gsel)}>このグループを抜ける</button></div></div>}
           <div className="card"><h2>グループを作る</h2><div className="sm" style={{ marginBottom: 6 }}>参加した人は、メンバー全員とフレンドになります（ポジション公開などフレンドに見える情報が、全員に見えます）。</div>
             <input value={gn} onChange={e => setGn(e.target.value)} placeholder="グループ名" maxLength={20} /><button className="btn" style={{ marginTop: 8 }} onClick={createGroup}>作成する</button></div>
@@ -374,10 +378,11 @@ export default function App() {
         {rtab === 'friend' && <div className="card"><h2>フレンドを追加</h2>
           <div className="sm" style={{ marginBottom: 6 }}>あなたのフレンドID：<b>{profile?.code}</b></div>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
-            <button className="btn g" onClick={async () => { try { await navigator.clipboard.writeText(profile.code); toast('IDをコピーしました'); } catch { toast(profile.code); } }}>IDをコピー</button>
+            <button className="btn g" onClick={async () => { toast((await copyText(profile.code)) ? 'IDをコピーしました' : 'コピーできません。IDを長押ししてコピーしてください'); }}>IDをコピー</button>
             <button className="btn g" onClick={copy}>招待リンクをコピー</button>
             <button className="btn g" onClick={async () => setQrUrl(qrUrl ? '' : await QRCode.toDataURL(invite, { width: 240, margin: 1 }))}>QRを表示</button>
             <button className="btn g" onClick={() => setScan(!scan)}>QRを読み取る</button></div>
+          <input readOnly value={invite} onFocus={e => e.target.select()} style={{ marginBottom: 10 }} aria-label="招待リンク" />
           {qrUrl && <div style={{ textAlign: 'center', marginBottom: 10 }}><img src={qrUrl} width={240} height={240} alt="招待QRコード" /><div className="sm">相手のカメラで読み取ってもらうか、この画面を見せてください</div></div>}
           {scan && <div style={{ marginBottom: 10 }}><video ref={vid} playsInline muted style={{ width: '100%', borderRadius: 10 }} /><div className="sm">相手のQRコードを枠に映してください</div></div>}
           <div className="sm" style={{ marginBottom: 6 }}>リンクを送ると、相手は開くだけ（ゲストでOK）でフレンドになります。IDを直接入力して追加もできます。</div>
