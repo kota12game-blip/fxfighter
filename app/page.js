@@ -174,7 +174,7 @@ export default function App() {
   const removeFriend = async r => { if (!confirm(r.name + ' さんをフレンドから削除しますか？')) return; await supabase.rpc('remove_friend', { fid: r.id }); setBoard(board.filter(x => x.id !== r.id)); toast('フレンドを削除しました'); };
   useEffect(() => { if (tab !== 'rank' || rtab !== 'group' || !user) return; loadGroups(); }, [tab, rtab, user]);
   useEffect(() => { if (tab !== 'rank' || rtab !== 'group' || !gsel) return; loadGBoard(); const i = setInterval(loadGBoard, 20000); return () => clearInterval(i); }, [tab, rtab, gsel]);
-  const claim = async () => {
+  const claimTransfers = async () => {
     if (!Sref.current) return;
     const { data } = await supabase.rpc('claim_transfers');
     if (!data || !data.length) return;
@@ -198,7 +198,7 @@ export default function App() {
     toast(sendTo.name + ' さんに ' + yen(a) + ' を送りました（相手が開くと届きます）');
     setSendTo(null); setAmt(''); setSnote(''); loadTransfers();
   };
-  useEffect(() => { if (!user || !S) return; claim(); const i = setInterval(claim, 20000); return () => clearInterval(i); }, [user, !!S]);
+  useEffect(() => { if (!user || !S) return; claimTransfers(); const i = setInterval(claimTransfers, 20000); return () => clearInterval(i); }, [user, !!S]);
   useEffect(() => { if (tab === 'rank' && rtab === 'friend' && user) loadTransfers(); }, [tab, rtab, user]);
   const buy = (key, price) => {
     if (C.free < price) return toast('使用可能資金が足りません');
