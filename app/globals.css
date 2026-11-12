@@ -16,3 +16,18 @@ input{font:inherit;width:100%;padding:9px 10px;border:1px solid var(--line);bord
 .trade{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.trade button{padding:12px 6px;border:0;border-radius:10px;color:#fff;font:inherit;font-weight:700}.trade .s{background:var(--dn)}.trade .b{background:var(--up)}
 canvas{width:100%;height:230px;display:block}h2{font-size:15px;margin:2px 0 8px}.warn{color:var(--dn);font-weight:700}.me{background:var(--chip);border-radius:8px;padding:5px 8px;margin:0 -8px}
 .toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:13px}
+.status{display:flex;flex-wrap:wrap;gap:4px 14px;padding:0 16px 8px;font-size:12px;color:var(--sub)}
+@media (min-width:900px){
+  body{max-width:1100px;font-size:17px}
+  header{padding:16px 24px 10px}header b{font-size:22px}
+  .status{padding:0 24px 10px;font-size:14px}
+  main{padding:8px 24px 24px}
+  .big{font-size:48px}
+  canvas{height:440px}
+  .card{padding:20px}
+  .mk{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(0,1fr);gap:16px;align-items:start}
+  .seg button{font-size:15px;padding:8px 0}
+  nav button{font-size:14px;padding:14px 0}
+}
+.pxbig{font-size:22px;font-weight:900;color:var(--ink);letter-spacing:-.01em}
+@media (min-width:900px){ .pxbig{font-size:36px} .status{align-items:baseline} }
