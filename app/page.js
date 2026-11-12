@@ -3,9 +3,10 @@ import { useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
+import { isMarketOpen } from '../lib/market';
 
 const LEV = 25, SP = 0.01;
-const fresh = () => ({ bal: 1e6, pos: [], ord: [], hist: [], bonusDay: '', bonusTotal: 0, bonusCount: 0, start: Date.now(), id: 1, items: { own: [], guard: 0 }, guardOn: false });
+const fresh = () => ({ bal: 1e6, pos: [], ord: [], hist: [], bonusDay: '', bonusTotal: 0, bonusCount: 0, start: Date.now(), id: 1, items: { own: [], guard: 0, ins: 0 }, guardOn: false, loan: null, insDay: '' });
 const yen = n => (n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
 const sgn = n => (n > 0 ? '+' : n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
 const cl = n => (n > 0 ? 'up' : n < 0 ? 'dn' : '');
@@ -14,6 +15,9 @@ const copyText = async t => {
   try { await navigator.clipboard.writeText(t); return true; } catch {}
   try { const a = document.createElement('textarea'); a.value = t; a.style.position = 'fixed'; a.style.opacity = '0'; document.body.appendChild(a); a.focus(); a.select(); const ok = document.execCommand('copy'); a.remove(); return ok; } catch { return false; }
 };
+// 借金：10日以内は元本の100%、以後10日ごとに元本の50%ずつ上乗せ（単利）
+const debtDue = (s, now = Date.now()) => { if (!s.loan) return 0; const d = (now - s.loan.at) / 864e5; const k = d <= 10 ? 0 : Math.ceil((d - 10) / 10); return s.loan.principal * (1 + 0.5 * k); };
+const loanNext = (s, now = Date.now()) => { const d = (now - s.loan.at) / 864e5; const k = d <= 10 ? 0 : Math.ceil((d - 10) / 10); return { days: 10 + 10 * k - d, next: s.loan.principal * (1 + 0.5 * (k + 1)) }; };
 const TITLES = [['見習いトレーダー', 30000], ['相場の旅人', 100000], ['ドル円職人', 300000], ['円安の覇者', 1000000]];
 const ICONS = [['🐣', 10000], ['🦊', 50000], ['🐺', 150000], ['🦁', 400000], ['🐉', 1000000]];
 const GUARD_PRICE = 60000, GUARD_MAX = 3;
@@ -50,11 +54,24 @@ export default function App() {
   const [amt, setAmt] = useState('');
   const [snote, setSnote] = useState('');
   const [tlist, setTlist] = useState([]);
-  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null);
+  const [nextAt, setNextAt] = useState(null);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const [lid, setLid] = useState('');
+  const [lpw, setLpw] = useState('');
+  const [rid, setRid] = useState('');
+  const [rpw, setRpw] = useState('');
+  const [npw, setNpw] = useState('');
+  const [loanAmt, setLoanAmt] = useState('');
+  const [repayAmt, setRepayAmt] = useState('');
+  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null), loaded = useRef(false);
 
   const mid = candles.length ? candles[candles.length - 1].c : 0;
   const bid = mid - SP / 2, ask = mid + SP / 2;
   midRef.current = mid;
+  const mktOpen = isMarketOpen();
+  // 価格が取得できない／15分以上更新されない場合は「取引を一時停止」
+  const feedDown = mktOpen && (!!err || (candles.length > 0 && Date.now() - candles[candles.length - 1].t > 15 * 60000));
+  const blocked = !mktOpen || feedDown;
   const toast = m => { setMsg(m); setTimeout(() => setMsg(''), 2600); };
   const post = (text, pnl) => { if (user) supabase.from('feed').insert({ user_id: user.id, text, pnl: pnl ?? null }).then(() => {}); };
 
@@ -62,16 +79,17 @@ export default function App() {
     let u = 0, mg = 0;
     s.pos.forEach(p => { u += p.side === 'buy' ? (m - SP / 2 - p.entry) * p.units : (p.entry - (m + SP / 2)) * p.units; mg += p.units * p.entry / LEV; });
     const eq = s.bal + u;
-    return { u, mg, eq, free: eq - mg, lvl: mg > 0 ? eq / mg * 100 : null };
+    const due = debtDue(s);
+    return { u, mg, eq, due, nw: eq - due, free: eq - mg, lvl: mg > 0 ? eq / mg * 100 : null };
   };
-  const C = S && mid ? calcOf(S, mid) : { u: 0, mg: 0, eq: S ? S.bal : 0, free: S ? S.bal : 0, lvl: null };
+  const C = S && mid ? calcOf(S, mid) : { u: 0, mg: 0, eq: S ? S.bal : 0, due: 0, nw: S ? S.bal : 0, free: S ? S.bal : 0, lvl: null };
 
   const commit = n => {
     Sref.current = n; setS({ ...n });
     clearTimeout(timer.current);
     timer.current = setTimeout(async () => {
       const n = Sref.current;
-      const eq = calcOf(n, midRef.current || 155).eq;
+      const eq = calcOf(n, midRef.current || 155).nw;
       await supabase.from('game_state').upsert({ user_id: user.id, data: n, updated_at: new Date().toISOString() });
       await supabase.from('profiles').update({ equity: eq, updated_at: new Date().toISOString() }).eq('id', user.id);
       await supabase.from('public_positions').upsert({ user_id: user.id, pos: profRef.current?.share_pos === false ? [] : n.pos.map(q => ({ side: q.side, units: q.units, entry: q.entry })), updated_at: new Date().toISOString() });
@@ -95,23 +113,33 @@ export default function App() {
       try { const f = localStorage.getItem('vm_f'); if (f) { localStorage.removeItem('vm_f'); await supabase.rpc('add_friend', { c: f }); history.replaceState(null, '', location.pathname); } } catch {}
       try { const g = localStorage.getItem('vm_g'); if (g) { localStorage.removeItem('vm_g'); await supabase.rpc('join_group', { c: g }); history.replaceState(null, '', location.pathname); } } catch {}
       const { data: g } = await supabase.from('game_state').select('data').eq('user_id', user.id).maybeSingle();
-      const s = Object.assign(fresh(), g?.data || {}); Sref.current = s; setS(s);
+      const s = Object.assign(fresh(), g?.data || {}); s.items = { own: [], guard: 0, ins: 0, ...(s.items || {}) }; Sref.current = s; setS(s);
     })();
   }, [user]);
-  // 価格取得（20秒ごと。サーバー側キャッシュは120秒）
+  // カウントダウン用の時計（1秒ごと）
+  useEffect(() => { const i = setInterval(() => setNowMs(Date.now()), 1000); return () => clearInterval(i); }, []);
+  // 価格取得：サーバーの「更新の区切り」に合わせて、全端末がほぼ同時に取りに行く
   useEffect(() => {
+    let timer, dead = false;
+    const schedule = ms => { if (dead) return; clearTimeout(timer); timer = setTimeout(go, ms); };
     const go = async () => {
-      try { const r = await fetch('/api/candles'); const j = await r.json(); if (j.candles) { setCandles(j.candles); setErr(''); } else setErr(j.error || '価格取得エラー'); }
-      catch { setErr('通信できません'); }
+      if (loaded.current && !isMarketOpen()) { schedule(60000); return; }
+      try {
+        const r = await fetch('/api/candles'); const j = await r.json();
+        if (j.candles) {
+          setCandles(j.candles); setNextAt(j.nextAt || null); setErr(''); loaded.current = true;
+          schedule(j.nextAt ? Math.max(3000, j.nextAt - Date.now() + 2000 + Math.random() * 3000) : 600000);
+        } else { setErr(j.error || '価格取得エラー'); schedule(15000); }
+      } catch { setErr('通信できません'); schedule(15000); }
     };
-    go(); const i = setInterval(go, 20000);
+    go();
     const vis = () => { if (!document.hidden) go(); };
     document.addEventListener('visibilitychange', vis);
-    return () => { clearInterval(i); document.removeEventListener('visibilitychange', vis); };
+    return () => { dead = true; clearTimeout(timer); document.removeEventListener('visibilitychange', vis); };
   }, []);
   // 指値約定・ロスカット判定（価格更新ごと）
   useEffect(() => {
-    const s = Sref.current; if (!s || !candles.length) return;
+    const s = Sref.current; if (!s || !candles.length || feedDown) return;
     const n = structuredClone(s); let ch = false;
     n.ord = n.ord.filter(o => {
       const hit = candles.some(c => c.t >= o.t - 60000 && (o.side === 'buy' ? c.l + SP / 2 <= o.price : c.h - SP / 2 >= o.price));
@@ -146,6 +174,8 @@ export default function App() {
     n.hist = n.hist.slice(0, 200); n.pos.splice(i, 1);
   }
   function place(side) {
+    if (!isMarketOpen()) return toast('市場が閉まっています（週末は取引できません）');
+    if (feedDown) return toast('価格データを取得できないため、取引を一時停止しています');
     if (!mid) return toast('価格を取得中です');
     if (qty < 1000 || qty % 1000) return toast('数量は1,000通貨単位で入力してください');
     const n = structuredClone(S);
@@ -202,7 +232,65 @@ export default function App() {
     toast(sendTo.name + ' さんに ' + yen(a) + ' を送りました（相手が開くと届きます）');
     setSendTo(null); setAmt(''); setSnote(''); loadTransfers();
   };
-  useEffect(() => { if (!user || !S) return; claimTransfers(); const i = setInterval(claimTransfers, 20000); return () => clearInterval(i); }, [user, !!S]);
+  const claimLevies = async () => {
+    if (!Sref.current) return;
+    const { data } = await supabase.rpc('claim_levies');
+    if (!data || !data.length) return;
+    const n = structuredClone(Sref.current); let paid = 0;
+    data.forEach(x => { const a = Math.min(Number(x.amount), Math.max(0, n.bal)); n.bal -= a; paid += a; });
+    Sref.current = n; setS(n);
+    await supabase.from('game_state').upsert({ user_id: user.id, data: n, updated_at: new Date().toISOString() });
+    toast('復興補助募金に ' + yen(paid) + ' を拠出しました');
+    post('🤝 復興補助募金に ' + yen(paid) + ' を拠出（' + data.map(x => x.to).join('・') + ' さん）');
+  };
+  const claimAll = async () => { await claimTransfers(); await claimLevies(); };
+  useEffect(() => { if (!user || !S) return; claimAll(); const i = setInterval(claimAll, 20000); return () => clearInterval(i); }, [user, !!S]);
+  const borrow = () => {
+    const a = Math.floor(Number(loanAmt));
+    if (S.loan) return toast('すでに借金があります。先に返済してください');
+    if (!(a >= 10000)) return toast('10,000円以上で入力してください');
+    if (a > 1000000) return toast('借りられるのは100万円までです');
+    const n = structuredClone(S); n.bal += a; n.loan = { principal: a, at: Date.now() }; commit(n);
+    post('🏦 銀行から ' + yen(a) + ' を借りた'); toast(yen(a) + ' を借りました'); setLoanAmt('');
+  };
+  const repay = all => {
+    if (!S.loan) return;
+    const due = debtDue(S);
+    const p = all ? due : Math.min(due, Math.floor(Number(repayAmt)));
+    if (!(p >= 1)) return toast('返済額を入力してください');
+    if (C.free < p) return toast('使用可能資金が足りません');
+    const n = structuredClone(S); n.bal -= p;
+    const full = p >= due - 0.5;
+    if (full) { n.loan = null; post('🏦 借金を完済した'); } else n.loan = { ...n.loan, principal: n.loan.principal * (1 - p / due) };
+    commit(n); toast(full ? '完済しました' : yen(p) + ' を返済しました'); setRepayAmt('');
+  };
+  const buyIns = () => {
+    if (S.insDay === today()) return toast('保険券は1日1回しか買えません');
+    if (S.items.ins >= 3) return toast('持てるのは最大3枚です');
+    if (C.free < 1300) return toast('使用可能資金が足りません');
+    const n = structuredClone(S); n.bal -= 1300; n.items.ins++; n.insDay = today(); commit(n); toast('FX保険券を買いました');
+  };
+  const useIns = () => {
+    const h = S.hist[0];
+    if (!S.items.ins) return toast('保険券がありません');
+    if (!h || h.void) return toast('取り消せる決済がありません');
+    if (!(h.pnl < 0 && h.pnl >= -1500)) return toast('損失が1,500円以内の決済だけ取り消せます');
+    const n = structuredClone(S); n.items.ins--; n.bal -= h.pnl; n.hist[0] = { ...h, was: h.pnl, pnl: 0, void: true }; commit(n);
+    post('🧾 FX保険券を使い、損失 ' + yen(-h.pnl) + ' を取り消した'); toast('損失を取り消しました');
+  };
+  const buyRelief = async () => {
+    if (C.free < 3000) return toast('使用可能資金が足りません');
+    const { data, error } = await supabase.rpc('buy_relief');
+    if (error || !data) return toast('失敗しました');
+    if (data.status === 'rich') return toast('総資産が80万円を超えているため購入できません');
+    if (data.status === 'already') return toast('復興補助募金は1日1回までです');
+    if (data.status === 'nodonor') return toast('総資産80万円以上のフレンドがいないため購入できません');
+    if (data.status !== 'ok') return toast('失敗しました');
+    const n = structuredClone(Sref.current); n.bal -= 3000; commit(n);
+    post('🤝 復興補助募金を使用！ ' + data.names.slice(0, 5).join('・') + (data.count > 5 ? ' ほか' : '') + ' から1,000円ずつ受け取り');
+    toast('復興補助募金を使いました（' + data.count + '人から ' + yen(data.count * 1000) + '）');
+    await claimTransfers();
+  };
   useEffect(() => { if (tab === 'rank' && rtab === 'friend' && user) loadTransfers(); }, [tab, rtab, user]);
   const buy = (key, price) => {
     if (C.free < price) return toast('使用可能資金が足りません');
@@ -269,7 +357,7 @@ export default function App() {
     // 取引マーカー（▲買い ▼売り）
     const idxOf = t => { let k = -1; d.forEach((c, i) => { if (c.t <= t) k = i; }); return k; };
     if (S) {
-      const items = S.pos.map(q => ({ t: q.t, price: q.entry, side: q.side })).concat(S.hist.slice(0, 20).filter(x => x.et).map(x => ({ t: x.et, price: x.entry, side: x.side })));
+      const items = S.pos.map(q => ({ t: q.t, price: q.entry, side: q.side }));
       items.forEach(it => { const i = idxOf(it.t); if (i < 0 || it.price > hi || it.price < lo) return; const x = i * cw + cw / 2, yy = y(it.price), buy = it.side === 'buy';
         g.fillStyle = buy ? up : dn; g.strokeStyle = css.getPropertyValue('--ink'); g.lineWidth = 1.2; g.beginPath();
         if (buy) { g.moveTo(x, yy - 2); g.lineTo(x - 6, yy + 9); g.lineTo(x + 6, yy + 9); } else { g.moveTo(x, yy + 2); g.lineTo(x - 6, yy - 9); g.lineTo(x + 6, yy - 9); }
@@ -285,32 +373,53 @@ export default function App() {
 
   if (user === undefined) return <main><p className="sm">読み込み中…</p></main>;
   const guest = async () => { const { error } = await supabase.auth.signInAnonymously({ options: { data: { name: gname.trim() || 'ゲスト' } } }); if (error) alert('ゲストログインに失敗: ' + error.message); };
-  const google = () => supabase.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.origin } });
-  const link = async () => { const { error } = await supabase.auth.linkIdentity({ provider: 'google', options: { redirectTo: location.origin } }); if (error) toast('連携に失敗: ' + error.message); };
+  const idMail = v => v.trim().toLowerCase() + '@vmarket.example.com';
+  const validId = v => /^[a-z0-9_]{3,20}$/.test(v.trim().toLowerCase());
+  const loginId = async () => {
+    if (!validId(lid)) return alert('IDは半角英数字とアンダースコアの3〜20文字です');
+    const { error } = await supabase.auth.signInWithPassword({ email: idMail(lid), password: lpw });
+    if (error) alert('ログインに失敗しました。IDまたはパスワードを確認してください');
+  };
+  const register = async () => {
+    if (!validId(rid)) return toast('IDは半角英数字とアンダースコアの3〜20文字です');
+    if (rpw.length < 6) return toast('パスワードは6文字以上にしてください');
+    const { error } = await supabase.auth.updateUser({ email: idMail(rid), password: rpw });
+    if (error) return toast(/already|registered|exists/i.test(error.message) ? 'このIDはすでに使われています' : '登録に失敗: ' + error.message);
+    await supabase.auth.refreshSession(); setRid(''); setRpw(''); toast('登録しました。IDとパスワードで、どの端末からでも入れます');
+  };
+  const changePw = async () => {
+    if (npw.length < 6) return toast('パスワードは6文字以上にしてください');
+    const { error } = await supabase.auth.updateUser({ password: npw }); setNpw(''); toast(error ? '変更に失敗しました' : 'パスワードを変更しました');
+  };
   const saveName = async () => { const n = nm.trim(); if (!n) return; await supabase.from('profiles').update({ name: n }).eq('id', user.id); setProfile({ ...profile, name: n }); toast('名前を変更しました'); };
   const invite = profile ? location.origin + '/?f=' + profile.code : '';
   const copy = async () => { toast((await copyText(invite)) ? '招待リンクをコピーしました' : 'コピーできません。下のリンクを長押ししてコピーしてください'); };
   if (!user) return (<main style={{ paddingTop: 50, textAlign: 'center' }}><h1>VIRTUAL MARKET</h1><p className="sm">本物のドル円の価格で遊べる仮想トレード</p>
     <div className="card"><input value={gname} onChange={e => setGname(e.target.value)} placeholder="ニックネーム" maxLength={12} /><button className="btn" style={{ marginTop: 8, width: '100%' }} onClick={guest}>ゲストで始める</button>
-      <p className="sm">登録不要。データはこの端末に紐づいて保存されます。あとからGoogleと連携すれば、他の端末でも続けられます。</p></div>
-    <div className="card"><button className="btn g" style={{ width: '100%' }} onClick={google}>Googleでログイン</button><p className="sm">すでにGoogle連携したアカウントで、別の端末から続けるとき用です。</p></div></main>);
+      <p className="sm">登録不要ですぐ遊べます。あとから設定でIDとパスワードを登録すれば、他の端末でも続けられます。</p></div>
+    <div className="card"><h2>IDでログイン</h2><input value={lid} onChange={e => setLid(e.target.value)} placeholder="ユーザーID（半角英数字）" autoCapitalize="none" autoCorrect="off" />
+      <input style={{ marginTop: 8 }} type="password" value={lpw} onChange={e => setLpw(e.target.value)} placeholder="パスワード" />
+      <button className="btn g" style={{ marginTop: 8, width: '100%' }} onClick={loginId}>ログイン</button><p className="sm">登録済みのIDで、別の端末から続けるときはこちら。</p></div></main>);
   if (!S) return <main><p className="sm">データを読み込み中…</p></main>;
 
   const real = S.hist.reduce((a, h) => a + h.pnl, 0);
   const left = (() => { const e = new Date(S.start); e.setMonth(e.getMonth() + 6); return Math.max(0, Math.ceil((e - Date.now()) / 864e5)); })();
   const canBonus = S.bonusDay !== today();
   const at = candles.length ? new Date(candles[candles.length - 1].t + 60000) : null;
+  const rem = nextAt ? Math.max(0, Math.ceil((nextAt - nowMs) / 1000)) : null;
+  const cd = rem === null ? '' : rem > 0 ? Math.floor(rem / 60) + ':' + String(rem % 60).padStart(2, '0') : '更新中…';
   const hhmm = at ? String(at.getHours()).padStart(2, '0') + ':' + String(at.getMinutes()).padStart(2, '0') : '--:--';
 
   return (<>
-    <header><b>VIRTUAL MARKET</b><span>{err ? '⚠ ' + err : '最終更新 ' + hhmm + '（最大2分遅れ）'}</span></header>
+    <header><b>VIRTUAL MARKET</b><span>{!mktOpen ? '市場休止中（最終 ' + hhmm + '）' : err ? '⚠ 価格を取得できません（取引を一時停止中）' : feedDown ? '⚠ 価格が更新されません（取引を一時停止中）' : '価格 ' + hhmm + '　次の更新まで ' + cd}</span></header>
     <main>
       {tab === 'home' && <>
-        <div className="card"><div className="sm">総資産</div><div className="big num">{yen(C.eq)}</div><div className={'sm num ' + cl(C.eq - 1e6)}>スタート比 {sgn(C.eq - 1e6)}</div></div>
+        <div className="card"><div className="sm">総資産</div><div className="big num">{yen(C.nw)}</div><div className={'sm num ' + cl(C.nw - 1e6)}>スタート比 {sgn(C.nw - 1e6)}</div></div>
         <div className="card">
           <div className="row"><span>現金残高</span><b className="num">{yen(S.bal)}</b></div>
           <div className="row"><span>含み損益</span><b className={'num ' + cl(C.u)}>{sgn(C.u)}</b></div>
           <div className="row"><span>確定損益</span><b className={'num ' + cl(real)}>{sgn(real)}</b></div>
+          {S.loan && <div className="row"><span>借金（現在の返済額）</span><b className="num dn">{yen(C.due)}</b></div>}
           <div className="row"><span>シーズン残り</span><b>{left}日</b></div></div>
         <div className="card"><h2>ログインボーナス</h2><div className="sm" style={{ marginBottom: 8 }}>1日1回 ¥20,000（受取{S.bonusCount}回・累計{yen(S.bonusTotal)}）</div>
           <button className="btn" disabled={!canBonus} onClick={claim}>{canBonus ? '¥20,000を受け取る' : '本日は受取済み'}</button></div>
@@ -321,16 +430,19 @@ export default function App() {
         <div className="card"><div className="sm">USD/JPY　米ドル／日本円</div>
           <div className="big num">{mid ? mid.toFixed(3) : '—'}</div>
           <div className="sm num">Bid {bid.toFixed(3)} / Ask {ask.toFixed(3)}　スプレッド{SP.toFixed(2)}円</div>
+          {mktOpen && cd && <div className="sm">次の更新まで {cd}（全端末が同時に更新されます）</div>}
+          {!mktOpen && <div className="sm warn">市場休止中です（週末）。日本時間の月曜早朝に再開します。</div>}
+          {feedDown && <div className="sm warn">価格を取得できないため、取引を一時停止しています。復旧すると自動で再開します。</div>}
           <div className="seg">{[1, 5, 15].map(k => <button key={k} className={tf === k ? 'on' : ''} onClick={() => setTf(k)}>{k}分</button>)}</div>
           <canvas ref={cv} />
-          <div className="sm">▲買い ▼売り（取引した位置）　赤い点線＝強制ロスカット価格の目安</div>
+          <div className="sm">▲買い ▼売り（保有中の建値。決済すると消えます）　赤い点線＝強制ロスカット価格の目安</div>
           {S.pos.length > 0 && lcPx(S) && <div className="sm warn num">強制ロスカット目安 {lcPx(S).toFixed(3)}（現在値との差 {Math.abs(mid - lcPx(S)).toFixed(2)}円）</div>}</div>
         <div className="card">
           <div className="seg">{[['market', '成行'], ['limit', '指値']].map(([k, l]) => <button key={k} className={otype === k ? 'on' : ''} onClick={() => setOtype(k)}>{l}</button>)}</div>
           <div className="sm">数量（通貨・1,000単位）</div><input type="number" inputMode="numeric" step="1000" value={qty} onChange={e => setQty(parseInt(e.target.value) || 0)} />
           {otype === 'limit' && <><div className="sm" style={{ marginTop: 8 }}>指値価格（円）</div><input type="number" inputMode="decimal" step="0.001" value={lp} onChange={e => setLp(e.target.value)} placeholder="例 155.000" /></>}
           <div className="sm num" style={{ marginTop: 8 }}>必要証拠金 {yen(qty * (otype === 'limit' && parseFloat(lp) ? parseFloat(lp) : mid) / LEV)}　使用可能 {yen(C.free)}　手数料 ¥0</div>
-          <div className="trade"><button className="s" onClick={() => place('sell')}><small>売り（Bid）</small><br />{bid.toFixed(3)}</button><button className="b" onClick={() => place('buy')}><small>買い（Ask）</small><br />{ask.toFixed(3)}</button></div>
+          <div className="trade"><button className="s" style={blocked ? { opacity: .45 } : undefined} onClick={() => place('sell')}><small>売り（Bid）</small><br />{bid.toFixed(3)}</button><button className="b" style={blocked ? { opacity: .45 } : undefined} onClick={() => place('buy')}><small>買い（Ask）</small><br />{ask.toFixed(3)}</button></div>
           <details className="sm" style={{ marginTop: 8 }}><summary>用語の説明</summary><p>Bid/Ask：売る価格/買う価格。差がスプレッド（実質コスト）。レバレッジ：証拠金の{LEV}倍まで取引可。維持率が50%未満で強制ロスカット。</p></details></div>
       </>}
       {tab === 'assets' && <>
@@ -349,12 +461,12 @@ export default function App() {
         {S.ord.length ? S.ord.map(o => <div className="card" key={o.id}><div className="row"><span>{o.side === 'buy' ? '買い' : '売り'}指値 {o.units.toLocaleString()}通貨</span><b className="num">{o.price.toFixed(3)}</b></div>
           <button className="btn g" onClick={() => { const n = structuredClone(S); n.ord = n.ord.filter(x => x.id !== o.id); commit(n); }}>取消</button></div>) : <div className="card sm">待機中の注文はありません</div>}
         <h2>取引履歴</h2>
-        <div className="card">{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
+        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
       </>}
       {tab === 'rank' && <>
         <div className="seg">{[['rank', 'ランキング'], ['feed', 'フィード'], ['group', 'グループ'], ['friend', 'フレンド']].map(([k, l]) => <button key={k} className={rtab === k ? 'on' : ''} onClick={() => setRtab(k)}>{l}</button>)}</div>
         {rtab === 'rank' && <div className="card"><h2>フレンドランキング（総資産）</h2>
-          {board.map((r, i) => <div key={r.id}><div className={'row' + (r.id === user.id ? ' me' : '')} style={{ cursor: 'pointer' }} onClick={() => r.id !== user.id && openPeer(r.id)}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.eq : r.equity)}</b></div>
+          {board.map((r, i) => <div key={r.id}><div className={'row' + (r.id === user.id ? ' me' : '')} style={{ cursor: 'pointer' }} onClick={() => r.id !== user.id && openPeer(r.id)}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b></div>
             {peer[r.id] && <div className="sm" style={{ padding: '0 0 6px 10px' }}>{peer[r.id].length ? peer[r.id].map((q, j) => <div key={j} className="num">{q.side === 'buy' ? '買い' : '売り'} {q.units.toLocaleString()}通貨 @{q.entry.toFixed(3)}　<span className={cl(ppl(q))}>{sgn(ppl(q))}</span></div>) : '非公開、またはポジションなし'}</div>}</div>)}
           <div className="sm" style={{ marginTop: 6 }}>{board.length <= 1 ? 'フレンドを追加すると順位が表示されます。' : 'フレンドの名前をタップすると保有ポジションが見られます。'}</div></div>}
         {rtab === 'feed' && (feed.length ? feed.map(f => <div className="card" key={f.id}>
@@ -367,7 +479,7 @@ export default function App() {
           {groups.length > 0 && <div className="card"><h2>グループランキング（総資産）</h2>
             <div className="seg" style={{ flexWrap: 'wrap' }}>{groups.map(x => <button key={x.id} className={gsel === x.id ? 'on' : ''} onClick={() => setGsel(x.id)}>{x.name}（{x.members}人）</button>)}</div>
             {(() => { const x = groups.find(y => y.id === gsel); return x && <div className="sm" style={{ marginBottom: 8 }}>グループコード：<b>{x.code}</b></div>; })()}
-            {gboard.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.eq : r.equity)}</b></div>)}
+            {gboard.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b></div>)}
             <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
               <button className="btn g" onClick={async () => { const x = groups.find(y => y.id === gsel); if (!x) return; const l = location.origin + '/?g=' + x.code; toast((await copyText(l)) ? 'グループ招待リンクをコピーしました' : 'コピーできません：' + l); }}>招待リンクをコピー</button>
               <button className="btn g" onClick={() => leaveGroup(gsel)}>このグループを抜ける</button></div></div>}
@@ -402,6 +514,23 @@ export default function App() {
       {tab === 'shop' && <>
         <button className="btn g" style={{ marginBottom: 12 }} onClick={() => setTab('home')}>← ホームに戻る</button>
         <div className="card"><div className="sm">使えるお金（使用可能資金）</div><div className="big num">{yen(C.free)}</div><div className="sm">買い物をすると総資産が減り、ランキングの順位も下がります。</div></div>
+        <div className="card"><h2>🏦 銀行（借金）</h2>
+          <div className="sm" style={{ marginBottom: 8 }}>最大100万円まで・同時に1件。借りてから10日以内に返せば元本のまま。以後10日ごとに元本の50%が上乗せされます（11〜20日は150%、21〜30日は200%…）。借金は総資産から引かれます。</div>
+          {S.loan ? <>
+            <div className="row"><span>元本</span><b className="num">{yen(S.loan.principal)}</b></div>
+            <div className="row"><span>現在の返済額</span><b className="num dn">{yen(C.due)}</b></div>
+            <div className="row"><span>次の上乗せ</span><b className="num">{Math.max(1, Math.ceil(loanNext(S, nowMs).days))}日後に {yen(loanNext(S, nowMs).next)}</b></div>
+            <input style={{ marginTop: 8 }} type="number" inputMode="numeric" value={repayAmt} onChange={e => setRepayAmt(e.target.value)} placeholder="返済する金額（円）" />
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}><button className="btn" onClick={() => repay(false)}>一部返済</button><button className="btn g" onClick={() => repay(true)}>全額返済</button></div>
+          </> : <>
+            <input type="number" inputMode="numeric" value={loanAmt} onChange={e => setLoanAmt(e.target.value)} placeholder="借りる金額（1万円〜100万円）" />
+            <button className="btn" style={{ marginTop: 8 }} onClick={borrow}>借りる</button></>}</div>
+        <div className="card"><h2>🤝 復興補助募金　{yen(3000)}</h2>
+          <div className="sm" style={{ marginBottom: 8 }}>総資産が80万円以下の人が、1日1回だけ買えます。総資産80万円以上のフレンド全員から、1,000円ずつ受け取ります（相手の残高は、相手が次にアプリを開いたとき引かれます）。使った人と払った人は、フィードに残ります。</div>
+          <div className="row" style={{ border: 0 }}><span>あなたの総資産：<b>{yen(C.nw)}</b></span><button className="btn" onClick={buyRelief}>購入</button></div></div>
+        <div className="card"><h2>🧾 FX保険券　{yen(1300)}</h2>
+          <div className="sm" style={{ marginBottom: 8 }}>1日1回だけ買えます（3枚まで所持可）。直近の決済が損失1,500円以内なら、その損失を返金して取り消せます（ポジションは戻りません）。使うのは「保有資産」の取引履歴からです。</div>
+          <div className="row" style={{ border: 0 }}><span>所持：<b>{S.items.ins}枚</b></span><button className="btn" onClick={buyIns}>購入（1日1回）</button></div></div>
         <div className="card"><h2>🛡 ロスカット回避券　{yen(GUARD_PRICE)}</h2>
           <div className="sm" style={{ marginBottom: 8 }}>強制ロスカットになりそうなとき、自動で1枚使われます。維持率が20%を下回るまで猶予が生まれ、50%まで回復すれば通常に戻ります。持てるのは最大{GUARD_MAX}枚。</div>
           <div className="row" style={{ border: 0 }}><span>所持：<b>{S.items.guard}枚</b>{S.guardOn && '（発動中）'}</span><button className="btn" onClick={() => buy('guard', GUARD_PRICE)}>購入</button></div></div>
@@ -413,9 +542,16 @@ export default function App() {
       {tab === 'set' && <>
         <div className="card"><h2>プロフィール</h2><input value={nm} onChange={e => setNm(e.target.value)} maxLength={12} /><button className="btn g" style={{ marginTop: 8 }} onClick={saveName}>名前を変更</button></div>
         <div className="card"><h2>アカウント</h2>
-          {user.is_anonymous ? <><p className="sm warn">ゲストでプレイ中です。ブラウザのデータを消したり端末を変えるとデータを失います。</p><button className="btn" onClick={link}>Googleと連携する</button><p className="sm">連携すると、PCなど他の端末からもGoogleログインで続きから遊べます。</p></>
-            : <><div className="sm" style={{ marginBottom: 8 }}>{user.email}（Google連携済み）</div><button className="btn g" onClick={() => supabase.auth.signOut()}>ログアウト</button></>}
-          {user.is_anonymous && <button className="btn g" style={{ marginTop: 8 }} onClick={() => { if (confirm('ゲストのままログアウトするとこのデータには戻れません。よろしいですか？')) supabase.auth.signOut(); }}>ログアウト</button>}</div>
+          {user.is_anonymous ? <>
+            <p className="sm warn">ゲストでプレイ中です。IDとパスワードを登録すると、他の端末でも続きから遊べます。</p>
+            <input value={rid} onChange={e => setRid(e.target.value)} placeholder="ユーザーID（半角英数字・3〜20文字）" autoCapitalize="none" autoCorrect="off" />
+            <input style={{ marginTop: 8 }} type="password" value={rpw} onChange={e => setRpw(e.target.value)} placeholder="パスワード（6文字以上）" />
+            <button className="btn" style={{ marginTop: 8 }} onClick={register}>登録する</button>
+            <p className="sm">パスワードを忘れると復旧できません。メモしておいてください。</p>
+            <button className="btn g" style={{ marginTop: 8 }} onClick={() => { if (confirm('ゲストのままログアウトするとこのデータには戻れません。よろしいですか？')) supabase.auth.signOut(); }}>ログアウト</button></>
+          : <><div className="sm" style={{ marginBottom: 8 }}>ユーザーID：<b>{(user.email || '').split('@')[0]}</b></div>
+            <input type="password" value={npw} onChange={e => setNpw(e.target.value)} placeholder="新しいパスワード（6文字以上）" />
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}><button className="btn g" onClick={changePw}>パスワードを変更</button><button className="btn g" onClick={() => supabase.auth.signOut()}>ログアウト</button></div></>}</div>
         <div className="card"><h2>プライバシー</h2><div className="sm" style={{ marginBottom: 8 }}>フレンドに保有ポジションを見せる：<b>{profile?.share_pos === false ? 'オフ' : 'オン'}</b></div>
           <button className="btn g" onClick={async () => { const v = profile?.share_pos === false; await supabase.from('profiles').update({ share_pos: v }).eq('id', user.id); const np = { ...profile, share_pos: v }; setProfile(np); profRef.current = np; commit(S); toast(v ? 'ポジションを公開します' : 'ポジションを非公開にしました'); }}>切り替える</button></div>
         <div className="card"><button className="btn g" onClick={() => setTut(0)}>遊び方（チュートリアル）</button></div>
