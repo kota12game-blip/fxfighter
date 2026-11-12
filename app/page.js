@@ -158,7 +158,7 @@ export default function App() {
         if (j.candles) {
           setCandles(j.candles); setNextAt(j.nextAt || null); setErr(''); loaded.current = true;
           setMeta(m => ({ interval: j.intervalSec || m.interval, mode: j.mode || 'normal', left: j.left ?? null, lastOk: Date.now(), fails: 0, lastErr: '' }));
-          schedule(j.nextAt ? Math.max(3000, j.nextAt - (Date.now() + offRef.current) + 2000 + Math.random() * 3000) : 600000);
+          schedule(j.nextAt ? Math.min(Math.max(3000, j.nextAt - (Date.now() + offRef.current) + 2000 + Math.random() * 3000), 6 * 60000) : (isMarketOpen(new Date(Date.now() + offRef.current)) ? 30000 : 600000));
         } else { const e = j.error || '価格取得エラー'; setErr(e); setMeta(m => ({ ...m, fails: m.fails + 1, lastErr: e })); schedule(15000); }
       } catch (e) { setErr('通信できません'); setMeta(m => ({ ...m, fails: m.fails + 1, lastErr: '通信できません' })); schedule(15000); }
       finally { busy = false; }
@@ -460,8 +460,9 @@ export default function App() {
     <header><b>VIRTUAL MARKET</b><button className="btn g" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => goRef.current && goRef.current()}>↻ 再取得</button></header>
     <div className="status">
       {mid > 0 && <span className="pxbig num">{mid.toFixed(3)}</span>}
-      {!mktOpen ? <span>市場休止中（最終価格 {hhmm}）</span> : err ? <span className="warn">⚠ 価格を取得できません：{err}（失敗{meta.fails}回・取引を一時停止中）</span> : feedDown ? <span className="warn">⚠ 価格が更新されません（取引を一時停止中）</span> : <>
-        <span>価格 {hhmm}</span><span>次の更新まで <b className="num">{cd || '--'}</b></span><span>更新間隔 {meta.interval / 60}分{meta.mode === 'slow' ? '（節約中）' : '（通常）'}</span>{meta.left != null && <span>API残り {meta.left}</span>}</>}
+      {!mktOpen ? <span>市場休止中（最終価格 {hhmm}）</span> : <>
+        {(err || feedDown) && <span className="warn">⚠ {err ? '価格を取得できません：' + err + '（失敗' + meta.fails + '回）' : '価格が更新されていません'}・取引を一時停止中</span>}
+        <span>価格 {hhmm}</span><span>次の更新まで <b className="num">{cd || '--'}</b></span><span>更新間隔 {meta.interval / 60}分{meta.mode === 'slow' ? '（節約中）' : '（通常）'}</span></>}
     </div>
     <main>
       {tab === 'home' && <>
