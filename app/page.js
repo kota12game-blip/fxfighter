@@ -6,7 +6,7 @@ import jsQR from 'jsqr';
 import { isMarketOpen } from '../lib/market';
 
 const LEV = 25, SP = 0.01;
-const fresh = () => ({ bal: 1e6, pos: [], ord: [], hist: [], bonusDay: '', bonusTotal: 0, bonusCount: 0, start: Date.now(), id: 1, items: { own: [], guard: 0, ins: 0 }, guardOn: false, loan: null, insDay: '' });
+const fresh = () => ({ bal: 1e6, pos: [], ord: [], hist: [], bonusDay: '', bonusTotal: 0, bonusCount: 0, start: Date.now(), id: 1, items: { own: [], guard: 0, ins: 0 }, guardOn: false, loan: null, insDay: '', vip: null, vipDay: '' });
 const yen = n => (n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
 const sgn = n => (n > 0 ? '+' : n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
 const cl = n => (n > 0 ? 'up' : n < 0 ? 'dn' : '');
@@ -68,11 +68,14 @@ export default function App() {
   const [gtop, setGtop] = useState([]);
   const [gme, setGme] = useState(null);
   const [gev, setGev] = useState([]);
+  const [gmode, setGmode] = useState('total');
+  const [ann, setAnn] = useState(null);
+  const [newVer, setNewVer] = useState(false);
   const [gview, setGview] = useState('rank');
   const [gfeed, setGfeed] = useState([]);
   const [gmsg, setGmsg] = useState('');
   const [meta, setMeta] = useState({ interval: 120, mode: 'normal', left: null, lastOk: 0, fails: 0, lastErr: '' });
-  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0);
+  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0), annQ = useRef([]), annBusy = useRef(false);
 
   const mid = candles.length ? candles[candles.length - 1].c : 0;
   const bid = mid - SP / 2, ask = mid + SP / 2;
@@ -81,12 +84,16 @@ export default function App() {
   // 端末の時計がずれていても動くよう、サーバー時刻との差(offRef)を使う
   const sNow = () => Date.now() + offRef.current;
   const mOpen = () => isMarketOpen(new Date(sNow()));
+  const jstDay = () => new Date(sNow() + 9 * 36e5).toISOString().slice(0, 10);
   const mktOpen = mOpen();
   // 価格が取得できない／15分以上更新されない場合は「取引を一時停止」
   const feedDown = mktOpen && (!!err || (candles.length > 0 && sNow() - candles[candles.length - 1].t > 15 * 60000));
   const blocked = !mktOpen || feedDown;
   const toast = m => { setMsg(m); setTimeout(() => setMsg(''), 2600); };
   const post = (text, pnl) => { if (user) supabase.from('feed').insert({ user_id: user.id, text, pnl: pnl ?? null }).then(() => {}); };
+  // 画面上部の「お知らせ」バナー（短時間表示・順番に表示）
+  const showNextAnn = () => { const t = annQ.current.shift(); if (!t) { annBusy.current = false; setAnn(null); return; } annBusy.current = true; setAnn(t); setTimeout(showNextAnn, 4000); };
+  const pushAnn = t => { if (annQ.current.length < 5) annQ.current.push(String(t).slice(0, 70)); if (!annBusy.current) showNextAnn(); };
   // 価格データがない・古い・市場休止のときは、新規注文も決済もできない
   const guardTrade = () => {
     if (!mid) { toast('価格データがありません。取得できるまでお待ちください'); return true; }
@@ -203,8 +210,14 @@ export default function App() {
   function close(n, id, auto) {
     const i = n.pos.findIndex(p => p.id === id); if (i < 0) return;
     const p = n.pos[i], ex = p.side === 'buy' ? bid : ask;
-    const pl = p.side === 'buy' ? (ex - p.entry) * p.units : (p.entry - ex) * p.units;
-    n.bal += pl; n.hist.unshift({ et: p.t, t: Date.now(), side: p.side, units: p.units, entry: p.entry, exit: ex, pnl: pl, auto: !!auto });
+    let pl = p.side === 'buy' ? (ex - p.entry) * p.units : (p.entry - ex) * p.units;
+    // 高級保険：契約中は、1日1回だけ、損失が3万円を超える決済を1万円に軽減する
+    let vipSaved = 0;
+    if (n.vip && n.vip.paidUntil > sNow() && n.vipDay !== jstDay() && pl < -30000) {
+      vipSaved = -pl - 10000; pl = -10000; n.vipDay = jstDay();
+      post('🛡 高級保険が発動！ 損失 ' + yen(10000 + vipSaved) + ' → ' + yen(10000) + ' に軽減');
+    }
+    n.bal += pl; n.hist.unshift({ et: p.t, t: Date.now(), side: p.side, units: p.units, entry: p.entry, exit: ex, pnl: pl, auto: !!auto, vip: vipSaved });
     n.hist = n.hist.slice(0, 200); n.pos.splice(i, 1);
   }
   function place(side) {
@@ -324,6 +337,59 @@ export default function App() {
     await claimTransfers();
   };
   useEffect(() => { if (tab === 'rank' && rtab === 'friend' && user) loadTransfers(); }, [tab, rtab, user]);
+  const contractVip = () => {
+    if (S.vip && S.vip.on) return;
+    if (C.free < 2000) return toast('使用可能資金が足りません');
+    const n = structuredClone(S); n.bal -= 2000;
+    const base = n.vip && n.vip.paidUntil > sNow() ? n.vip.paidUntil : sNow();
+    n.vip = { on: true, paidUntil: base + 3600000 }; commit(n);
+    post('💎 高級保険に加入'); toast('高級保険に加入しました');
+  };
+  const cancelVip = () => { const n = structuredClone(S); n.vip = { ...n.vip, on: false }; commit(n); toast('解約しました（支払い済みの時間の終わりまで有効です）'); };
+  const billVip = () => {
+    const s0 = Sref.current; if (!s0 || !s0.vip || !s0.vip.on) return;
+    if (sNow() < s0.vip.paidUntil) return;
+    const n = structuredClone(s0);
+    if ((midRef.current ? calcOf(n, midRef.current).free : n.bal) < 2000) { n.vip.on = false; commit(n); toast('高級保険：資金不足のため自動解約されました'); return; }
+    n.bal -= 2000;
+    const base = sNow() - n.vip.paidUntil > 120000 ? sNow() : n.vip.paidUntil;
+    n.vip.paidUntil = base + 3600000; commit(n);
+  };
+  useEffect(() => { if (!user || !S) return; billVip(); const i = setInterval(billVip, 30000); return () => clearInterval(i); }, [user, !!S]);
+  // フィードの動きを、どの画面にいても上のお知らせで知らせる（30秒ごとに確認）
+  useEffect(() => {
+    if (!user) return;
+    let alive = true; const last = { f: -1, g: -1, gr: {} };
+    const go = async () => {
+      try {
+        const out = [];
+        const { data: f } = await supabase.from('feed').select('id,user_id,text,profiles(name,icon)').order('id', { ascending: false }).limit(10);
+        const mf = (f || []).reduce((m, x) => Math.max(m, x.id), 0);
+        if (last.f >= 0) (f || []).filter(x => x.id > last.f && x.user_id !== user.id).reverse().forEach(x => out.push((x.profiles?.icon || '') + ' ' + (x.profiles?.name || '') + '：' + x.text));
+        last.f = Math.max(last.f, mf);
+        const { data: g } = await supabase.from('global_events').select('id,text').order('id', { ascending: false }).limit(5);
+        const mg = (g || []).reduce((m, x) => Math.max(m, x.id), 0);
+        if (last.g >= 0) (g || []).filter(x => x.id > last.g).reverse().forEach(x => out.push(x.text));
+        last.g = Math.max(last.g, mg);
+        const { data: gl } = await supabase.rpc('my_groups');
+        for (const x of (gl || []).slice(0, 3)) {
+          const { data: rows } = await supabase.rpc('group_feed_list', { gid: x.id });
+          const mx = (rows || []).reduce((m, r) => Math.max(m, r.id), 0);
+          if (last.gr[x.id] !== undefined) (rows || []).filter(r => r.id > last.gr[x.id] && r.user_id !== user.id).reverse().forEach(r => out.push('【' + x.name + '】 ' + (r.kind === 'rank' ? r.text : (STAMP_EM[r.stamp] || '') + ' ' + (r.name || '') + ' が' + (STAMP_LB[r.stamp] || '') + 'スタンプ')));
+          last.gr[x.id] = Math.max(last.gr[x.id] || 0, mx);
+        }
+        if (alive) out.slice(-3).forEach(pushAnn);
+      } catch {}
+    };
+    go(); const i = setInterval(go, 30000);
+    return () => { alive = false; clearInterval(i); };
+  }, [user]);
+  // 新しいバージョン（デプロイ）の検知
+  useEffect(() => {
+    let v0 = null, shown = false;
+    const go = async () => { try { const r = await fetch('/api/version', { cache: 'no-store' }); const j = await r.json(); if (v0 === null) v0 = j.v; else if (j.v !== v0 && !shown) { shown = true; setNewVer(true); pushAnn('🆕 新しいバージョンが公開されました。再読み込みしてください'); } } catch {} };
+    go(); const i = setInterval(go, 120000); return () => clearInterval(i);
+  }, []);
   const buy = (key, price) => {
     if (C.free < price) return toast('使用可能資金が足りません');
     const n = structuredClone(S);
@@ -340,11 +406,11 @@ export default function App() {
   };
   useEffect(() => { if (tab !== 'rank' || rtab !== 'group' || !gsel || gview !== 'feed') return; loadGFeed(); const i = setInterval(loadGFeed, 10000); return () => clearInterval(i); }, [tab, rtab, gsel, gview]);
   const loadGlobal = async () => {
-    const { data } = await supabase.rpc('global_board', { lim: 50 }); setGtop(data || []);
+    const { data } = await supabase.rpc(gmode === 'daily' ? 'global_daily' : 'global_board', { lim: 200 }); setGtop(data || []);
     const { data: me } = await supabase.rpc('global_me'); setGme(me || null);
     supabase.rpc('check_top3').then(() => {});
   };
-  useEffect(() => { if (tab !== 'rank' || rtab !== 'global' || !user) return; loadGlobal(); const i = setInterval(loadGlobal, 30000); return () => clearInterval(i); }, [tab, rtab, user]);
+  useEffect(() => { if (tab !== 'rank' || rtab !== 'global' || !user) return; loadGlobal(); const i = setInterval(loadGlobal, 30000); return () => clearInterval(i); }, [tab, rtab, user, gmode]);
   const loadFeed = async () => { const { data } = await supabase.from('feed').select('id,user_id,text,pnl,created_at,profiles(name,title,icon),reactions(emoji,user_id)').order('created_at', { ascending: false }).limit(40); setFeed(data || []); const { data: ge } = await supabase.from('global_events').select('id,text,created_at').order('created_at', { ascending: false }).limit(15); setGev(ge || []); };
   const react = async (f, emoji) => {
     const mine = f.reactions.some(r => r.user_id === user.id && r.emoji === emoji);
@@ -417,7 +483,13 @@ export default function App() {
   }, [candles, tf, tab, S]);
 
   if (user === undefined) return <main><p className="sm">読み込み中…</p></main>;
-  const guest = async () => { const { error } = await supabase.auth.signInAnonymously({ options: { data: { name: gname.trim() || 'ゲスト' } } }); if (error) alert('ゲストログインに失敗: ' + error.message); };
+  const guest = async () => {
+    const nmv = gname.trim(); if (!nmv) return alert('ニックネームを入力してください');
+    const { data: free } = await supabase.rpc('name_available', { n: nmv });
+    if (free === false) return alert('この名前はすでに使われています。別の名前にしてください');
+    const { error } = await supabase.auth.signInAnonymously({ options: { data: { name: nmv } } });
+    if (error) alert('ゲストログインに失敗: ' + error.message);
+  };
   const idMail = v => v.trim().toLowerCase() + '@vmarket.example.com';
   const validId = v => /^[a-z0-9_]{3,20}$/.test(v.trim().toLowerCase());
   const loginId = async () => {
@@ -436,7 +508,7 @@ export default function App() {
     if (npw.length < 6) return toast('パスワードは6文字以上にしてください');
     const { error } = await supabase.auth.updateUser({ password: npw }); setNpw(''); toast(error ? '変更に失敗しました' : 'パスワードを変更しました');
   };
-  const saveName = async () => { const n = nm.trim(); if (!n) return; await supabase.from('profiles').update({ name: n }).eq('id', user.id); setProfile({ ...profile, name: n }); toast('名前を変更しました'); };
+  const saveName = async () => { const n = nm.trim(); if (!n) return; const { data, error } = await supabase.rpc('set_name', { n }); if (error || data !== 'ok') return toast(data === 'taken' ? 'この名前はすでに使われています' : '変更できませんでした'); setProfile({ ...profile, name: n.slice(0, 12) }); toast('名前を変更しました'); };
   const invite = profile ? location.origin + '/?f=' + profile.code : '';
   const copy = async () => { toast((await copyText(invite)) ? '招待リンクをコピーしました' : 'コピーできません。下のリンクを長押ししてコピーしてください'); };
   if (!user) return (<main style={{ paddingTop: 50, textAlign: 'center' }}><h1>VIRTUAL MARKET</h1><p className="sm">本物のドル円の価格で遊べる仮想トレード</p>
@@ -448,6 +520,7 @@ export default function App() {
   if (!S) return <main><p className="sm">データを読み込み中…</p></main>;
 
   const feedAll = [...feed, ...gev.map(e => ({ ...e, _g: true }))].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 50);
+  const peerBox = id => peer[id] && <div className="sm" style={{ padding: '0 0 6px 10px' }}>{peer[id].length ? peer[id].map((q, j) => <div key={j} className="num">{q.side === 'buy' ? '買い' : '売り'} {q.units.toLocaleString()}通貨 @{q.entry.toFixed(3)}　<span className={cl(ppl(q))}>{sgn(ppl(q))}</span></div>) : '非公開、またはポジションなし'}</div>;
   const real = S.hist.reduce((a, h) => a + h.pnl, 0);
   const left = (() => { const e = new Date(S.start); e.setMonth(e.getMonth() + 6); return Math.max(0, Math.ceil((e - Date.now()) / 864e5)); })();
   const canBonus = S.bonusDay !== today();
@@ -460,6 +533,7 @@ export default function App() {
     <header><b>VIRTUAL MARKET</b><button className="btn g" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => goRef.current && goRef.current()}>↻ 再取得</button></header>
     <div className="status">
       {mid > 0 && <span className="pxbig num">{mid.toFixed(3)}</span>}
+      {newVer && <button className="btn" style={{ padding: '2px 10px', fontSize: 12 }} onClick={() => location.reload()}>🆕 新しいバージョン：再読み込み</button>}
       {!mktOpen ? <span>市場休止中（最終価格 {hhmm}）</span> : <>
         {(err || feedDown) && <span className="warn">⚠ {err ? '価格を取得できません：' + err + '（失敗' + meta.fails + '回）' : '価格が更新されていません'}・取引を一時停止中</span>}
         <span>価格 {hhmm}</span><span>次の更新まで <b className="num">{cd || '--'}</b></span><span>更新間隔 {meta.interval / 60}分{meta.mode === 'slow' ? '（節約中）' : '（通常）'}</span></>}
@@ -513,7 +587,7 @@ export default function App() {
         {S.ord.length ? S.ord.map(o => <div className="card" key={o.id}><div className="row"><span>{o.side === 'buy' ? '買い' : '売り'}指値 {o.units.toLocaleString()}通貨</span><b className="num">{o.price.toFixed(3)}</b></div>
           <button className="btn g" onClick={() => { const n = structuredClone(S); n.ord = n.ord.filter(x => x.id !== o.id); commit(n); }}>取消</button></div>) : <div className="card sm">待機中の注文はありません</div>}
         <h2>取引履歴</h2>
-        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
+        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}{x.vip ? '（高級保険で軽減）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
       </>}
       {tab === 'rank' && <>
         <div className="seg">{[['rank', 'フレンド順位'], ['global', '全体順位'], ['feed', 'フィード'], ['group', 'グループ'], ['friend', 'フレンド']].map(([k, l]) => <button key={k} className={rtab === k ? 'on' : ''} onClick={() => setRtab(k)}>{l}</button>)}</div>
@@ -521,12 +595,13 @@ export default function App() {
           {board.map((r, i) => <div key={r.id}><div className={'row' + (r.id === user.id ? ' me' : '')} style={{ cursor: 'pointer' }} onClick={() => r.id !== user.id && openPeer(r.id)}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b></div>
             {peer[r.id] && <div className="sm" style={{ padding: '0 0 6px 10px' }}>{peer[r.id].length ? peer[r.id].map((q, j) => <div key={j} className="num">{q.side === 'buy' ? '買い' : '売り'} {q.units.toLocaleString()}通貨 @{q.entry.toFixed(3)}　<span className={cl(ppl(q))}>{sgn(ppl(q))}</span></div>) : '非公開、またはポジションなし'}</div>}</div>)}
           <div className="sm" style={{ marginTop: 6 }}>{board.length <= 1 ? 'フレンドを追加すると順位が表示されます。' : 'フレンドの名前をタップすると保有ポジションが見られます。'}</div></div>}
-        {rtab === 'global' && <div className="card"><h2>全体ランキング（総資産）</h2>
-          <div className="sm" style={{ marginBottom: 8 }}>総資産は各端末からの自己申告です。お遊び用の参考順位としてお楽しみください。</div>
-          {gme && gme.on === false ? <div className="sm warn" style={{ marginBottom: 8 }}>「全体ランキングに表示」がオフです（設定で変更できます）。</div> : gme && <div className="row me"><span>あなたの順位</span><b className="num">{gme.rank}位 / {gme.total}人</b></div>}
-          {gtop.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{['🥇', '🥈', '🥉'][i] || (i + 1) + '位'}　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b></div>)}
-          {!gtop.length && <div className="sm">まだデータがありません</div>}
-          <div className="sm" style={{ marginTop: 8 }}>上位50人まで表示。TOP3が入れ替わると、フィードにお知らせが出ます。</div></div>}
+        {rtab === 'global' && <div className="card"><h2>全体ランキング（全員参加）</h2>
+          <div className="seg">{[['total', '総資産'], ['daily', '本日の利益']].map(([k, l]) => <button key={k} className={gmode === k ? 'on' : ''} onClick={() => { setGmode(k); setGtop([]); }}>{l}</button>)}</div>
+          <div className="sm" style={{ marginBottom: 8 }}>{gmode === 'daily' ? '日本時間0時からの総資産の増減です。送金や借金なども含みます。' : '総資産は各端末からの自己申告です。お遊び用の参考順位としてお楽しみください。'}</div>
+          {gmode === 'total' && gme && <div className="row me"><span>あなたの順位</span><b className="num">{gme.rank}位 / {gme.total}人</b></div>}
+          {gtop.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{['🥇', '🥈', '🥉'][i] || (i + 1) + '位'}　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span>{gmode === 'daily' ? <b className={'num ' + cl(r.gain)}>{sgn(r.gain)}</b> : <b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b>}</div>)}
+          {!gtop.length && <div className="sm">読み込み中…</div>}
+          <div className="sm" style={{ marginTop: 8 }}>登録している全員を表示します（最大200人）。TOP3が入れ替わると、フィードとお知らせに出ます。</div></div>}
         {rtab === 'feed' && (feedAll.length ? feedAll.map(f => f._g ? <div className="card" key={'g' + f.id}><div className="row" style={{ border: 0 }}><b>🏆 全体のできごと</b><span className="sm">{new Date(f.created_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div><div>{f.text}</div></div> : <div className="card" key={f.id}>
           <div className="row" style={{ border: 0 }}><span><b>{f.profiles?.icon} {f.user_id === user.id ? 'あなた' : (f.profiles?.name || '')}</b> {f.profiles?.title && <span className="sm">【{f.profiles.title}】</span>}</span><span className="sm">{new Date(f.created_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div>
           <div>{f.text}{f.pnl != null && <b className={'num ' + cl(f.pnl)}>　{sgn(f.pnl)}</b>}</div>
@@ -538,7 +613,7 @@ export default function App() {
             <div className="seg" style={{ flexWrap: 'wrap' }}>{groups.map(x => <button key={x.id} className={gsel === x.id ? 'on' : ''} onClick={() => setGsel(x.id)}>{x.name}（{x.members}人）</button>)}</div>
             {(() => { const x = groups.find(y => y.id === gsel); return x && <div className="sm" style={{ marginBottom: 8 }}>グループコード：<b>{x.code}</b></div>; })()}
             <div className="seg">{[['rank', '順位'], ['feed', 'フィード']].map(([k, l]) => <button key={k} className={gview === k ? 'on' : ''} onClick={() => setGview(k)}>{l}</button>)}</div>
-            {gview === 'rank' && gboard.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b></div>)}
+            {gview === 'rank' && gboard.map((r, i) => <div key={r.id}><div className={'row' + (r.id === user.id ? ' me' : '')} style={{ cursor: 'pointer' }} onClick={() => r.id !== user.id && openPeer(r.id)}><span>{i + 1}位　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span><b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b></div>{peerBox(r.id)}</div>)}
             {gview === 'feed' && <div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>{STAMPS.map(([k, em, lb]) => <button key={k} className="btn g" style={{ padding: '6px 10px' }} onClick={() => sendStamp(k)}>{em} {lb}</button>)}</div>
               <input value={gmsg} onChange={e => setGmsg(e.target.value)} placeholder="ひとこと（任意・スタンプと一緒に送ります）" maxLength={40} />
@@ -594,6 +669,13 @@ export default function App() {
         <div className="card"><h2>🧾 FX保険券　{yen(1300)}</h2>
           <div className="sm" style={{ marginBottom: 8 }}>1日1回だけ買えます（3枚まで所持可）。直近の決済が損失1,500円以内なら、その損失を返金して取り消せます（ポジションは戻りません）。使うのは「保有資産」の取引履歴からです。</div>
           <div className="row" style={{ border: 0 }}><span>所持：<b>{S.items.ins}枚</b></span><button className="btn" onClick={buyIns}>購入（1日1回）</button></div></div>
+        <div className="card"><h2>💎 高級保険　{yen(2000)}／時間</h2>
+          <div className="sm" style={{ marginBottom: 8 }}>契約中は、1日1回（日本時間0時に復活）だけ、損失が3万円を超える決済の損失を1万円に軽減します。1時間ごとに2,000円がかかり、自動更新です。いつでも解約できます（支払い済みの時間の終わりまでは有効）。</div>
+          {(() => { const v = S.vip, act = v && v.paidUntil > nowMs, used = S.vipDay === jstDay(); return <>
+            <div className="row"><span>状態</span><b>{act ? (v.on ? '契約中（自動更新）' : '解約済み（支払い済み分は有効）') : '未契約'}</b></div>
+            {act && <div className="row"><span>{v.on ? '次の更新まで' : '有効期限まで'}</span><b className="num">{Math.max(0, Math.ceil((v.paidUntil - nowMs) / 60000))}分</b></div>}
+            <div className="row"><span>本日の発動</span><b>{used ? '使用済み' : '未使用'}</b></div>
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>{v && v.on ? <button className="btn g" onClick={cancelVip}>解約する</button> : <button className="btn" onClick={contractVip}>契約する（初回 {yen(2000)}）</button>}</div></>; })()}</div>
         <div className="card"><h2>🛡 ロスカット回避券　{yen(GUARD_PRICE)}</h2>
           <div className="sm" style={{ marginBottom: 8 }}>強制ロスカットになりそうなとき、自動で1枚使われます。維持率が20%を下回るまで猶予が生まれ、50%まで回復すれば通常に戻ります。持てるのは最大{GUARD_MAX}枚。</div>
           <div className="row" style={{ border: 0 }}><span>所持：<b>{S.items.guard}枚</b>{S.guardOn && '（発動中）'}</span><button className="btn" onClick={() => buy('guard', GUARD_PRICE)}>購入</button></div></div>
@@ -625,9 +707,7 @@ export default function App() {
           <div className="row"><span>端末の時計のずれ</span><b className="num">{(offRef.current / 1000).toFixed(1)}秒</b></div>
           <button className="btn g" style={{ marginTop: 8 }} onClick={() => goRef.current && goRef.current()}>↻ 今すぐ再取得</button></div>
         <div className="card"><h2>プライバシー</h2><div className="sm" style={{ marginBottom: 8 }}>フレンドに保有ポジションを見せる：<b>{profile?.share_pos === false ? 'オフ' : 'オン'}</b></div>
-          <button className="btn g" onClick={async () => { const v = profile?.share_pos === false; await supabase.from('profiles').update({ share_pos: v }).eq('id', user.id); const np = { ...profile, share_pos: v }; setProfile(np); profRef.current = np; commit(S); toast(v ? 'ポジションを公開します' : 'ポジションを非公開にしました'); }}>切り替える</button>
-          <div className="sm" style={{ margin: '12px 0 8px' }}>全体ランキングに表示する：<b>{profile?.global_on === false ? 'オフ' : 'オン'}</b></div>
-          <button className="btn g" onClick={async () => { const v = profile?.global_on === false; await supabase.from('profiles').update({ global_on: v }).eq('id', user.id); const np = { ...profile, global_on: v }; setProfile(np); profRef.current = np; toast(v ? '全体ランキングに表示します' : '全体ランキングから非表示にしました'); }}>切り替える</button></div>
+          <button className="btn g" onClick={async () => { const v = profile?.share_pos === false; await supabase.from('profiles').update({ share_pos: v }).eq('id', user.id); const np = { ...profile, share_pos: v }; setProfile(np); profRef.current = np; commit(S); toast(v ? 'ポジションを公開します' : 'ポジションを非公開にしました'); }}>切り替える</button></div>
         <div className="card"><button className="btn g" onClick={() => setTut(0)}>遊び方（チュートリアル）</button></div>
         <div className="card"><button className="btn g" onClick={() => { if (confirm('最初からやり直しますか？')) commit(fresh()); }}>データをリセット</button></div>
       </>}
@@ -652,6 +732,7 @@ export default function App() {
             <span style={{ display: 'flex', gap: 8 }}>{tut > 0 && <button className="btn g" onClick={() => setTut(tut - 1)}>戻る</button>}
               <button className="btn" onClick={() => last ? done() : setTut(tut + 1)}>{last ? 'はじめる' : '次へ'}</button></span></div></div></div>;
     })()}
+    {ann && <div className="ann" role="status">{ann}</div>}
     {msg && <div className="toast" role="status">{msg}</div>}
     <nav>{TABS.map(([k, l]) => <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{l}</button>)}</nav>
   </>);
