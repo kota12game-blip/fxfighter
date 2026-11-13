@@ -1,3 +1,4 @@
+import { createClient } from '@supabase/supabase-js';
 import { isMarketOpen, SLOT_SEC, SLOW_SEC } from '../../../lib/market';
 
 // Twelve Dataの1分足を取得。
@@ -8,7 +9,7 @@ export const dynamic = 'force-dynamic';
 
 const CLOSED_TTL = 6 * 3600 * 1000, PLAN_LIMIT = 800;
 let mem = { at: 0, nextAt: 0, candles: null, interval: SLOT_SEC, mode: 'normal', left: null };
-let used = { day: '', n: 0 };
+let used = { day: '', n: 0 }; // DBが使えないときの予備カウント
 let lastFail = 0;
 
 const ok = (m, maxAge, open) => Response.json(
@@ -30,12 +31,20 @@ async function refresh(now, key) {
   const j = await res.json();
   if (!j.values) throw new Error(j.message || '価格を取得できません');
   const candles = j.values.map(v => ({ t: new Date(v.datetime.replace(' ', 'T') + 'Z').getTime(), o: +v.open, h: +v.high, l: +v.low, c: +v.close })).reverse();
-  // 残りクレジット：APIのヘッダーがあればそれを使い、なければこのサーバーでの回数から推定
-  const day = new Date(now).toISOString().slice(0, 10);
-  if (used.day !== day) used = { day, n: 0 };
-  used.n++;
-  // ※ヘッダーの値は「1分あたりの残り」の可能性があり、1日の残りと取り違えると常に節約モードになるため使わない
-  const left = Math.max(0, PLAN_LIMIT - used.n);
+  // API使用量：取得するたびにDBへ加算（豪ドル追加後は通貨の数だけ加算）。UTC0時（日本時間9時）に800へ戻る
+  const PAIRS = 1;
+  let usedToday = null;
+  try {
+    const sb = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+    const { data } = await sb.rpc('api_budget_add', { n: PAIRS });
+    if (typeof data === 'number') usedToday = data;
+  } catch {}
+  if (usedToday === null) { // DBが使えないときは、このサーバーでの回数から推定
+    const day = new Date(now).toISOString().slice(0, 10);
+    if (used.day !== day) used = { day, n: 0 };
+    used.n += PAIRS; usedToday = used.n;
+  }
+  const left = Math.max(0, PLAN_LIMIT - usedToday);
   const interval = pickInterval(left, now);
   const nextAt = (Math.floor(now / (interval * 1000)) + 1) * interval * 1000;
   mem = { at: now, nextAt, candles, interval, mode: interval === SLOT_SEC ? 'normal' : 'slow', left };
