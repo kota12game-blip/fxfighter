@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase';
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 import { isMarketOpen } from '../lib/market';
+import AdminPanel from './admin';
 
 const LEV = 25, SP = 0.01;
 const fresh = () => ({ bal: 1e6, pos: [], ord: [], hist: [], bonusDay: '', bonusTotal: 0, bonusCount: 0, start: Date.now(), id: 1, items: { own: [], guard: 0, ins: 0 }, guardOn: false, loan: null, insDay: '', vip: null, vipDay: '' });
@@ -68,6 +69,10 @@ export default function App() {
   const [gtop, setGtop] = useState([]);
   const [gme, setGme] = useState(null);
   const [gev, setGev] = useState([]);
+  const [loadErr, setLoadErr] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [anns, setAnns] = useState([]);
+  const [reqText, setReqText] = useState('');
   const [gmode, setGmode] = useState('total');
   const [ann, setAnn] = useState(null);
   const [newVer, setNewVer] = useState(false);
@@ -75,7 +80,7 @@ export default function App() {
   const [gfeed, setGfeed] = useState([]);
   const [gmsg, setGmsg] = useState('');
   const [meta, setMeta] = useState({ interval: 120, mode: 'normal', left: null, lastOk: 0, fails: 0, lastErr: '' });
-  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0), annQ = useRef([]), annBusy = useRef(false);
+  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0), annQ = useRef([]), annBusy = useRef(false), verRef = useRef(0), dirtyRef = useRef(false), savingRef = useRef(false), evtRef = useRef({ evt: 'tick', logs: [], id: null }), stateOk = useRef(false);
 
   const mid = candles.length ? candles[candles.length - 1].c : 0;
   const bid = mid - SP / 2, ask = mid + SP / 2;
@@ -111,19 +116,71 @@ export default function App() {
   };
   const C = S && mid ? calcOf(S, mid) : { u: 0, mg: 0, eq: S ? S.bal : 0, due: 0, nw: S ? S.bal : 0, free: S ? S.bal : 0, lvl: null };
 
-  const commit = n => {
-    Sref.current = n; setS({ ...n });
-    clearTimeout(timer.current);
-    timer.current = setTimeout(async () => {
-      const n = Sref.current;
-      const eq = calcOf(n, midRef.current || 155).nw;
-      await supabase.from('game_state').upsert({ user_id: user.id, data: n, updated_at: new Date().toISOString() });
-      await supabase.from('profiles').update({ equity: eq, updated_at: new Date().toISOString() }).eq('id', user.id);
-      await supabase.from('public_positions').upsert({ user_id: user.id, pos: profRef.current?.share_pos === false ? [] : n.pos.map(q => ({ side: q.side, units: q.units, entry: q.entry })), updated_at: new Date().toISOString() });
-      await supabase.rpc('check_top3');
-      const { data: gl } = await supabase.rpc('my_groups'); (gl || []).forEach(x => supabase.rpc('check_group_rank', { gid: x.id }).then(() => {}));
-    }, 1500);
+  // ===== データ保存（バージョン管理）：サーバーが日時とバージョンを管理し、古い端末からの上書きを拒否する =====
+  const newId = () => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2));
+  const normState = d => { const s0 = Object.assign(fresh(), d || {}); s0.items = { own: [], guard: 0, ins: 0, ...(s0.items || {}) }; return s0; };
+  // サーバーの正規データを採用する
+  const adopt = (r, why) => {
+    const s0 = normState(r.data);
+    Sref.current = s0; setS(s0); verRef.current = r.version || 0; dirtyRef.current = false;
+    evtRef.current = { evt: 'tick', logs: [], id: null };
+    toast(why === 'pull' ? '他の端末で更新されたデータを読み込みました' : '古いデータの保存を拒否し、最新のデータに更新しました');
+    if (why !== 'pull') post('⚠️ 古い端末のデータ保存を検知。サーバーの最新データに置き換えました');
   };
+  const afterSave = async (n, nw) => {
+    await supabase.from('public_positions').upsert({ user_id: user.id, pos: profRef.current?.share_pos === false ? [] : n.pos.map(q => ({ side: q.side, units: q.units, entry: q.entry })), updated_at: new Date().toISOString() });
+    await supabase.rpc('report_equity', { e: nw, base: verRef.current });
+    await supabase.rpc('check_top3');
+    const { data: gl } = await supabase.rpc('my_groups'); (gl || []).forEach(x => supabase.rpc('check_group_rank', { gid: x.id }).then(() => {}));
+  };
+  const flush = async () => {
+    if (savingRef.current || !stateOk.current) return;
+    savingRef.current = true;
+    try {
+      while (dirtyRef.current) {
+        dirtyRef.current = false;
+        const n = Sref.current, ev = evtRef.current;
+        evtRef.current = { evt: 'tick', logs: [], id: null };
+        if (!ev.id) ev.id = newId();
+        const nw = calcOf(n, midRef.current || 155).nw;
+        const { data, error } = await supabase.rpc('save_state', { p_data: n, p_base: verRef.current, p_event: ev.evt, p_event_id: ev.id, p_nw: nw, p_log: ev.logs.length ? ev.logs : null });
+        if (error || !data) {
+          const nx = evtRef.current;
+          evtRef.current = { evt: ev.evt === 'tick' && nx.evt === 'tick' ? 'tick' : 'event', logs: [...ev.logs, ...nx.logs], id: nx.logs.length || nx.evt !== 'tick' ? null : ev.id };
+          dirtyRef.current = true; setTimeout(flush, 5000); break;
+        }
+        if (data.status === 'ok' || data.status === 'dup') {
+          verRef.current = data.version;
+          if (data.status === 'dup' && JSON.stringify(Sref.current) !== JSON.stringify(n)) dirtyRef.current = true;
+          afterSave(n, nw);
+        } else if (data.status === 'conflict' || data.status === 'reject') { adopt(data, 'conflict'); break; }
+        else { dirtyRef.current = true; setTimeout(flush, 8000); break; }
+      }
+    } finally { savingRef.current = false; }
+  };
+  const commit = (n, evt = 'event') => {
+    Sref.current = n; setS({ ...n });
+    if (!stateOk.current) return;
+    dirtyRef.current = true;
+    if (evt !== 'tick') evtRef.current.evt = 'event';
+    if (evt === 'tick') { clearTimeout(timer.current); timer.current = setTimeout(flush, 1500); } else flush();
+  };
+  // 他の端末で保存された新しいデータがあれば読み込む
+  const syncNow = async () => {
+    if (!stateOk.current || savingRef.current || dirtyRef.current) return;
+    const { data: v } = await supabase.rpc('state_version');
+    if (typeof v === 'number' && v > verRef.current) {
+      const { data: ls } = await supabase.rpc('load_state');
+      if (ls && ls.version > verRef.current && !dirtyRef.current && !savingRef.current) adopt(ls, 'pull');
+    }
+  };
+  useEffect(() => {
+    if (!user || !S) return;
+    const wake = () => { if (!document.hidden) syncNow(); };
+    const i = setInterval(wake, 30000);
+    document.addEventListener('visibilitychange', wake); window.addEventListener('focus', wake);
+    return () => { clearInterval(i); document.removeEventListener('visibilitychange', wake); window.removeEventListener('focus', wake); };
+  }, [user, !!S]);
 
   // ログイン状態
   useEffect(() => {
@@ -137,12 +194,13 @@ export default function App() {
     if (!user) return;
     (async () => {
       const { data: p } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-      setProfile(p); profRef.current = p; setNm(p?.name || '');
+      setProfile(p); profRef.current = p; setNm(p?.name || ''); { const { data: adm } = await supabase.rpc('is_admin'); setIsAdmin(adm === true); }
       try { if (!localStorage.getItem('vm_tut')) setTut(0); } catch {}
       try { const f = localStorage.getItem('vm_f'); if (f) { localStorage.removeItem('vm_f'); await supabase.rpc('add_friend', { c: f }); history.replaceState(null, '', location.pathname); } } catch {}
       try { const g = localStorage.getItem('vm_g'); if (g) { localStorage.removeItem('vm_g'); await supabase.rpc('join_group', { c: g }); history.replaceState(null, '', location.pathname); } } catch {}
-      const { data: g } = await supabase.from('game_state').select('data').eq('user_id', user.id).maybeSingle();
-      const s = Object.assign(fresh(), g?.data || {}); s.items = { own: [], guard: 0, ins: 0, ...(s.items || {}) }; Sref.current = s; setS(s);
+      const { data: ls, error: lerr } = await supabase.rpc('load_state');
+      if (lerr) { setLoadErr(true); return; }
+      const s = normState(ls && ls.data); verRef.current = (ls && ls.version) || 0; Sref.current = s; setS(s); stateOk.current = true;
     })();
   }, [user]);
   // カウントダウン用の時計（1秒ごと）
@@ -201,11 +259,11 @@ export default function App() {
   // ランキング
   useEffect(() => {
     if (tab !== 'rank' || !user) return;
-    const go = async () => { const { data } = await supabase.from('profiles').select('id,name,equity,code,title,icon').order('equity', { ascending: false }); setBoard(data || []); };
-    go(); const i = setInterval(go, 20000); return () => clearInterval(i);
+    const go = async () => { const { data } = await supabase.from('profiles').select('id,name,equity,code,title,icon').not('equity', 'is', null).order('equity', { ascending: false }); setBoard(data || []); };
+    go(); const i = setInterval(() => { if (!document.hidden) go(); }, 30000); return () => clearInterval(i);
   }, [tab, user]);
   // ランキングに載る自分の総資産は価格更新に合わせて保存
-  useEffect(() => { if (S && user && mid) commit(S); }, [mid]);
+  useEffect(() => { if (S && user && mid && stateOk.current) supabase.rpc('report_equity', { e: calcOf(Sref.current, mid).nw, base: verRef.current }).then(() => supabase.rpc('check_top3')); }, [mid]);
 
   function close(n, id, auto) {
     const i = n.pos.findIndex(p => p.id === id); if (i < 0) return;
@@ -213,11 +271,12 @@ export default function App() {
     let pl = p.side === 'buy' ? (ex - p.entry) * p.units : (p.entry - ex) * p.units;
     // 高級保険：契約中は、1日1回だけ、損失が3万円を超える決済を1万円に軽減する
     let vipSaved = 0;
-    if (n.vip && n.vip.paidUntil > sNow() && n.vipDay !== jstDay() && pl < -30000) {
+    if (n.vip && n.vip.paidUntil > sNow() && n.vipDay !== jstDay() && pl <= -30000 && pl >= -65000) {
       vipSaved = -pl - 10000; pl = -10000; n.vipDay = jstDay();
       post('🛡 高級保険が発動！ 損失 ' + yen(10000 + vipSaved) + ' → ' + yen(10000) + ' に軽減');
     }
     n.bal += pl; n.hist.unshift({ et: p.t, t: Date.now(), side: p.side, units: p.units, entry: p.entry, exit: ex, pnl: pl, auto: !!auto, vip: vipSaved });
+    evtRef.current.logs.push({ kind: 'close', ...n.hist[0] });
     n.hist = n.hist.slice(0, 200); n.pos.splice(i, 1);
   }
   function place(side) {
@@ -236,7 +295,7 @@ export default function App() {
     }
     commit(n);
   }
-  const claim = () => { const n = structuredClone(S); n.bonusDay = today(); n.bal += 20000; n.bonusTotal += 20000; n.bonusCount++; commit(n); toast('ログインボーナス ¥20,000'); };
+  const claim = () => { if (new Date(sNow() + 9 * 36e5).getUTCDay() === 0) return toast('日曜日はログインボーナスはお休みです'); const n = structuredClone(S); n.bonusDay = today(); n.bal += 20000; n.bonusTotal += 20000; n.bonusCount++; commit(n); toast('ログインボーナス ¥20,000'); };
   const addFriend = async () => {
     const { data, error } = await supabase.rpc('add_friend', { c: code });
     toast(error ? '失敗しました' : data === 'ok' ? 'フレンドになりました' : data === 'self' ? '自分のIDです' : 'IDが見つかりません');
@@ -258,9 +317,7 @@ export default function App() {
     const { data } = await supabase.rpc('claim_transfers');
     if (!data || !data.length) return;
     const sum = data.reduce((a, x) => a + Number(x.amount), 0);
-    const n = structuredClone(Sref.current); n.bal += sum;
-    Sref.current = n; setS(n);
-    await supabase.from('game_state').upsert({ user_id: user.id, data: n, updated_at: new Date().toISOString() });
+    const n = structuredClone(Sref.current); n.bal += sum; commit(n);
     toast((data[0].from || 'フレンド') + ' さんから ' + yen(sum) + ' 受け取りました' + (data.length > 1 ? '（他' + (data.length - 1) + '件）' : ''));
   };
   const loadTransfers = async () => { const { data } = await supabase.from('transfers').select('id,amount,note,created_at,from_user,to_user,fp:profiles!transfers_from_user_fkey(name),tp:profiles!transfers_to_user_fkey(name)').order('created_at', { ascending: false }).limit(10); setTlist(data || []); };
@@ -283,20 +340,20 @@ export default function App() {
     if (!data || !data.length) return;
     const n = structuredClone(Sref.current); let paid = 0;
     data.forEach(x => { const a = Math.min(Number(x.amount), Math.max(0, n.bal)); n.bal -= a; paid += a; });
-    Sref.current = n; setS(n);
-    await supabase.from('game_state').upsert({ user_id: user.id, data: n, updated_at: new Date().toISOString() });
+    commit(n);
     toast('復興補助募金に ' + yen(paid) + ' を拠出しました');
     post('🤝 復興補助募金に ' + yen(paid) + ' を拠出（' + data.map(x => x.to).join('・') + ' さん）');
   };
-  const claimAll = async () => { await claimTransfers(); await claimLevies(); };
-  useEffect(() => { if (!user || !S) return; claimAll(); const i = setInterval(claimAll, 20000); return () => clearInterval(i); }, [user, !!S]);
+  const claimAll = async () => { await syncNow(); await claimTransfers(); await claimLevies(); };
+  useEffect(() => { if (!user || !S) return; claimAll(); const i = setInterval(() => { if (!document.hidden) claimAll(); }, 45000); return () => clearInterval(i); }, [user, !!S]);
   const borrow = () => {
     const a = Math.floor(Number(loanAmt));
     if (S.loan) return toast('すでに借金があります。先に返済してください');
     if (!(a >= 10000)) return toast('10,000円以上で入力してください');
     if (a > 1000000) return toast('借りられるのは100万円までです');
-    const n = structuredClone(S); n.bal += a; n.loan = { principal: a, at: Date.now() }; commit(n);
-    post('🏦 銀行から ' + yen(a) + ' を借りた'); toast(yen(a) + ' を借りました'); setLoanAmt('');
+    const fee = Math.round(a * 0.01);
+    const n = structuredClone(S); n.bal += a - fee; n.loan = { principal: a, at: Date.now() }; commit(n);
+    post('🏦 銀行から ' + yen(a) + ' を借りた（手数料 ' + yen(fee) + '）'); toast(yen(a - fee) + ' を受け取りました（手数料 ' + yen(fee) + '）'); setLoanAmt('');
   };
   const repay = all => {
     if (!S.loan) return;
@@ -359,7 +416,7 @@ export default function App() {
   // フィードの動きを、どの画面にいても上のお知らせで知らせる（30秒ごとに確認）
   useEffect(() => {
     if (!user) return;
-    let alive = true; const last = { f: -1, g: -1, gr: {} };
+    let alive = true; const last = { f: -1, g: -1, a: -1, gr: {} };
     const go = async () => {
       try {
         const out = [];
@@ -371,6 +428,10 @@ export default function App() {
         const mg = (g || []).reduce((m, x) => Math.max(m, x.id), 0);
         if (last.g >= 0) (g || []).filter(x => x.id > last.g).reverse().forEach(x => out.push(x.text));
         last.g = Math.max(last.g, mg);
+        const { data: an } = await supabase.from('announcements').select('id,text').order('id', { ascending: false }).limit(3);
+        const ma = (an || []).reduce((m, x) => Math.max(m, x.id), 0);
+        if (last.a >= 0) (an || []).filter(x => x.id > last.a).reverse().forEach(x => out.push('📢 ' + x.text));
+        last.a = Math.max(last.a, ma);
         const { data: gl } = await supabase.rpc('my_groups');
         for (const x of (gl || []).slice(0, 3)) {
           const { data: rows } = await supabase.rpc('group_feed_list', { gid: x.id });
@@ -381,7 +442,7 @@ export default function App() {
         if (alive) out.slice(-3).forEach(pushAnn);
       } catch {}
     };
-    go(); const i = setInterval(go, 30000);
+    go(); const i = setInterval(() => { if (!document.hidden) go(); }, 60000);
     return () => { alive = false; clearInterval(i); };
   }, [user]);
   // 新しいバージョン（デプロイ）の検知
@@ -398,6 +459,11 @@ export default function App() {
   };
   const equip = async (field, val) => { await supabase.from('profiles').update({ [field]: val }).eq('id', user.id); const np = { ...profile, [field]: val }; setProfile(np); profRef.current = np; };
   const ppl = q => (q.side === 'buy' ? (bid - q.entry) : (q.entry - ask)) * q.units;
+  const sendRequest = async () => {
+    const { data, error } = await supabase.rpc('send_request', { msg: reqText });
+    if (error || data !== 'ok') return toast(data === 'slow' ? '送信が多すぎます。少し待ってください' : '送れませんでした');
+    setReqText(''); toast('送信しました。全体フィードに表示されます'); loadFeed();
+  };
   const loadGFeed = async () => { if (!gsel) return; const { data } = await supabase.rpc('group_feed_list', { gid: gsel }); setGfeed(data || []); };
   const sendStamp = async k => {
     const { data, error } = await supabase.rpc('group_post', { gid: gsel, st: k, msg: gmsg });
@@ -411,7 +477,8 @@ export default function App() {
     supabase.rpc('check_top3').then(() => {});
   };
   useEffect(() => { if (tab !== 'rank' || rtab !== 'global' || !user) return; loadGlobal(); const i = setInterval(loadGlobal, 30000); return () => clearInterval(i); }, [tab, rtab, user, gmode]);
-  const loadFeed = async () => { const { data } = await supabase.from('feed').select('id,user_id,text,pnl,created_at,profiles(name,title,icon),reactions(emoji,user_id)').order('created_at', { ascending: false }).limit(40); setFeed(data || []); const { data: ge } = await supabase.from('global_events').select('id,text,created_at').order('created_at', { ascending: false }).limit(15); setGev(ge || []); };
+  const loadFeed = async () => { const { data } = await supabase.from('feed').select('id,user_id,text,pnl,created_at,profiles(name,title,icon),reactions(emoji,user_id)').order('created_at', { ascending: false }).limit(40); setFeed(data || []); const { data: ge } = await supabase.from('global_events').select('id,kind,text,created_at').order('created_at', { ascending: false }).limit(15); setGev(ge || []);
+    const { data: an } = await supabase.from('announcements').select('id,text,created_at').order('id', { ascending: false }).limit(5); setAnns(an || []); };
   const react = async (f, emoji) => {
     const mine = f.reactions.some(r => r.user_id === user.id && r.emoji === emoji);
     if (mine) await supabase.from('reactions').delete().match({ feed_id: f.id, user_id: user.id, emoji });
@@ -517,13 +584,15 @@ export default function App() {
     <div className="card"><h2>IDでログイン</h2><input value={lid} onChange={e => setLid(e.target.value)} placeholder="ユーザーID（半角英数字）" autoCapitalize="none" autoCorrect="off" />
       <input style={{ marginTop: 8 }} type="password" value={lpw} onChange={e => setLpw(e.target.value)} placeholder="パスワード" />
       <button className="btn g" style={{ marginTop: 8, width: '100%' }} onClick={loginId}>ログイン</button><p className="sm">登録済みのIDで、別の端末から続けるときはこちら。</p></div></main>);
+  if (loadErr) return <main style={{ paddingTop: 60, textAlign: 'center' }}><p className="warn">データを読み込めませんでした。</p><p className="sm">通信を確認して、ページを再読み込みしてください。（データは消えていません）</p><button className="btn" onClick={() => location.reload()}>再読み込み</button></main>;
   if (!S) return <main><p className="sm">データを読み込み中…</p></main>;
 
   const feedAll = [...feed, ...gev.map(e => ({ ...e, _g: true }))].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 50);
   const peerBox = id => peer[id] && <div className="sm" style={{ padding: '0 0 6px 10px' }}>{peer[id].length ? peer[id].map((q, j) => <div key={j} className="num">{q.side === 'buy' ? '買い' : '売り'} {q.units.toLocaleString()}通貨 @{q.entry.toFixed(3)}　<span className={cl(ppl(q))}>{sgn(ppl(q))}</span></div>) : '非公開、またはポジションなし'}</div>;
   const real = S.hist.reduce((a, h) => a + h.pnl, 0);
   const left = (() => { const e = new Date(S.start); e.setMonth(e.getMonth() + 6); return Math.max(0, Math.ceil((e - Date.now()) / 864e5)); })();
-  const canBonus = S.bonusDay !== today();
+  const isSun = new Date(sNow() + 9 * 36e5).getUTCDay() === 0;
+  const canBonus = S.bonusDay !== today() && !isSun;
   const at = candles.length ? new Date(candles[candles.length - 1].t + 60000) : null;
   const rem = nextAt ? Math.max(0, Math.ceil((nextAt - nowMs) / 1000)) : null;
   const cd = rem === null ? '' : rem > 0 ? Math.floor(rem / 60) + ':' + String(rem % 60).padStart(2, '0') : '更新中…';
@@ -547,8 +616,8 @@ export default function App() {
           <div className="row"><span>確定損益</span><b className={'num ' + cl(real)}>{sgn(real)}</b></div>
           {S.loan && <div className="row"><span>借金（現在の返済額）</span><b className="num dn">{yen(C.due)}</b></div>}
           <div className="row"><span>シーズン残り</span><b>{left}日</b></div></div>
-        <div className="card"><h2>ログインボーナス</h2><div className="sm" style={{ marginBottom: 8 }}>1日1回 ¥20,000（受取{S.bonusCount}回・累計{yen(S.bonusTotal)}）</div>
-          <button className="btn" disabled={!canBonus} onClick={claim}>{canBonus ? '¥20,000を受け取る' : '本日は受取済み'}</button></div>
+        <div className="card"><h2>ログインボーナス</h2><div className="sm" style={{ marginBottom: 8 }}>1日1回 ¥20,000（日曜日はお休み・受取{S.bonusCount}回・累計{yen(S.bonusTotal)}）</div>
+          <button className="btn" disabled={!canBonus} onClick={claim}>{canBonus ? '¥20,000を受け取る' : isSun ? '日曜日はお休みです' : '本日は受取済み'}</button></div>
         <div className="card"><h2>ショップ</h2><div className="sm" style={{ marginBottom: 8 }}>称号・アイコン・ロスカット回避券（所持 {S.items.guard}枚）</div><button className="btn" onClick={() => setTab('shop')}>ショップを見る</button></div>
         <div className="card"><h2>遊び方</h2><button className="btn g" onClick={() => setTut(0)}>チュートリアルを見る</button></div>
       </>}
@@ -602,7 +671,13 @@ export default function App() {
           {gtop.map((r, i) => <div className={'row' + (r.id === user.id ? ' me' : '')} key={r.id}><span>{['🥇', '🥈', '🥉'][i] || (i + 1) + '位'}　{r.icon} {r.id === user.id ? 'あなた' : r.name} {r.title && <span className="sm">【{r.title}】</span>}</span>{gmode === 'daily' ? <b className={'num ' + cl(r.gain)}>{sgn(r.gain)}</b> : <b className="num">{yen(r.id === user.id ? C.nw : r.equity)}</b>}</div>)}
           {!gtop.length && <div className="sm">読み込み中…</div>}
           <div className="sm" style={{ marginTop: 8 }}>登録している全員を表示します（最大200人）。TOP3が入れ替わると、フィードとお知らせに出ます。</div></div>}
-        {rtab === 'feed' && (feedAll.length ? feedAll.map(f => f._g ? <div className="card" key={'g' + f.id}><div className="row" style={{ border: 0 }}><b>🏆 全体のできごと</b><span className="sm">{new Date(f.created_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div><div>{f.text}</div></div> : <div className="card" key={f.id}>
+        {rtab === 'feed' && <div className="card"><h2>📢 運営からのお知らせ</h2>
+          {anns.length ? anns.map(a => <div className="row" key={a.id} style={{ alignItems: 'flex-start' }}><span>{a.text}</span><span className="sm">{new Date(a.created_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div>) : <div className="sm">お知らせはまだありません</div>}
+          <h2 style={{ marginTop: 14 }}>不具合・補填の要望を送る</h2>
+          <div className="sm" style={{ marginBottom: 6 }}>全体フィードに表示され、運営が確認します。</div>
+          <input value={reqText} onChange={e => setReqText(e.target.value)} placeholder="例：決済ができませんでした（120文字まで）" maxLength={120} />
+          <button className="btn" style={{ marginTop: 8 }} onClick={sendRequest}>送る</button></div>}
+        {rtab === 'feed' && (feedAll.length ? feedAll.map(f => f._g ? <div className="card" key={'g' + f.id}><div className="row" style={{ border: 0 }}><b>{f.kind === 'admin' ? '🛠 運営の操作' : f.kind === 'request' ? '📩 ユーザーからの要望' : '🏆 全体のできごと'}</b><span className="sm">{new Date(f.created_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div><div>{f.text}</div></div> : <div className="card" key={f.id}>
           <div className="row" style={{ border: 0 }}><span><b>{f.profiles?.icon} {f.user_id === user.id ? 'あなた' : (f.profiles?.name || '')}</b> {f.profiles?.title && <span className="sm">【{f.profiles.title}】</span>}</span><span className="sm">{new Date(f.created_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span></div>
           <div>{f.text}{f.pnl != null && <b className={'num ' + cl(f.pnl)}>　{sgn(f.pnl)}</b>}</div>
           <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>{['👍', '🔥', '😱', '😂'].map(e => { const n = f.reactions.filter(x => x.emoji === e).length, mine = f.reactions.some(x => x.emoji === e && x.user_id === user.id);
@@ -653,7 +728,7 @@ export default function App() {
         <button className="btn g" style={{ marginBottom: 12 }} onClick={() => setTab('home')}>← ホームに戻る</button>
         <div className="card"><div className="sm">使えるお金（使用可能資金）</div><div className="big num">{yen(C.free)}</div><div className="sm">買い物をすると総資産が減り、ランキングの順位も下がります。</div></div>
         <div className="card"><h2>🏦 銀行（借金）</h2>
-          <div className="sm" style={{ marginBottom: 8 }}>最大100万円まで・同時に1件。借りてから10日以内に返せば元本のまま。以後10日ごとに元本の50%が上乗せされます（11〜20日は150%、21〜30日は200%…）。借金は総資産から引かれます。</div>
+          <div className="sm" style={{ marginBottom: 8 }}>最大100万円まで・同時に1件。借りてから10日以内に返せば元本のまま。以後10日ごとに元本の50%が上乗せされます（11〜20日は150%、21〜30日は200%…）。借りるときに、借りる金額の1%が手数料としてかかります。借金は総資産から引かれます。</div>
           {S.loan ? <>
             <div className="row"><span>元本</span><b className="num">{yen(S.loan.principal)}</b></div>
             <div className="row"><span>現在の返済額</span><b className="num dn">{yen(C.due)}</b></div>
@@ -670,7 +745,7 @@ export default function App() {
           <div className="sm" style={{ marginBottom: 8 }}>1日1回だけ買えます（3枚まで所持可）。直近の決済が損失1,500円以内なら、その損失を返金して取り消せます（ポジションは戻りません）。使うのは「保有資産」の取引履歴からです。</div>
           <div className="row" style={{ border: 0 }}><span>所持：<b>{S.items.ins}枚</b></span><button className="btn" onClick={buyIns}>購入（1日1回）</button></div></div>
         <div className="card"><h2>💎 高級保険　{yen(2000)}／時間</h2>
-          <div className="sm" style={{ marginBottom: 8 }}>契約中は、1日1回（日本時間0時に復活）だけ、損失が3万円を超える決済の損失を1万円に軽減します。1時間ごとに2,000円がかかり、自動更新です。いつでも解約できます（支払い済みの時間の終わりまでは有効）。</div>
+          <div className="sm" style={{ marginBottom: 8 }}>契約中は、1日1回（日本時間0時に復活）だけ、損失が3万円以上6万5千円以下の決済の損失を1万円に軽減します（6万5千円を超える損失は対象外）。1時間ごとに2,000円がかかり、自動更新です。いつでも解約できます（支払い済みの時間の終わりまでは有効）。</div>
           {(() => { const v = S.vip, act = v && v.paidUntil > nowMs, used = S.vipDay === jstDay(); return <>
             <div className="row"><span>状態</span><b>{act ? (v.on ? '契約中（自動更新）' : '解約済み（支払い済み分は有効）') : '未契約'}</b></div>
             {act && <div className="row"><span>{v.on ? '次の更新まで' : '有効期限まで'}</span><b className="num">{Math.max(0, Math.ceil((v.paidUntil - nowMs) / 60000))}分</b></div>}
@@ -685,6 +760,7 @@ export default function App() {
           return <div className="row" key={ic}><span style={{ fontSize: 22 }}>{ic}</span>{own ? <button className="btn g" onClick={() => equip('icon', profile?.icon === ic ? null : ic)}>{profile?.icon === ic ? '外す' : '装備'}</button> : <button className="btn" onClick={() => buy(key, pr)}>{yen(pr)}</button>}</div>; })}</div>
       </>}
       {tab === 'set' && <>
+        {isAdmin && <AdminPanel supabase={supabase} toast={toast} yen={yen} />}
         <div className="card"><h2>プロフィール</h2><input value={nm} onChange={e => setNm(e.target.value)} maxLength={12} /><button className="btn g" style={{ marginTop: 8 }} onClick={saveName}>名前を変更</button></div>
         <div className="card"><h2>アカウント</h2>
           {user.is_anonymous ? <>
@@ -707,7 +783,7 @@ export default function App() {
           <div className="row"><span>端末の時計のずれ</span><b className="num">{(offRef.current / 1000).toFixed(1)}秒</b></div>
           <button className="btn g" style={{ marginTop: 8 }} onClick={() => goRef.current && goRef.current()}>↻ 今すぐ再取得</button></div>
         <div className="card"><h2>プライバシー</h2><div className="sm" style={{ marginBottom: 8 }}>フレンドに保有ポジションを見せる：<b>{profile?.share_pos === false ? 'オフ' : 'オン'}</b></div>
-          <button className="btn g" onClick={async () => { const v = profile?.share_pos === false; await supabase.from('profiles').update({ share_pos: v }).eq('id', user.id); const np = { ...profile, share_pos: v }; setProfile(np); profRef.current = np; commit(S); toast(v ? 'ポジションを公開します' : 'ポジションを非公開にしました'); }}>切り替える</button></div>
+          <button className="btn g" onClick={async () => { const v = profile?.share_pos === false; await supabase.from('profiles').update({ share_pos: v }).eq('id', user.id); const np = { ...profile, share_pos: v }; setProfile(np); profRef.current = np; commit(S, 'tick'); toast(v ? 'ポジションを公開します' : 'ポジションを非公開にしました'); }}>切り替える</button></div>
         <div className="card"><button className="btn g" onClick={() => setTut(0)}>遊び方（チュートリアル）</button></div>
         <div className="card"><button className="btn g" onClick={() => { if (confirm('最初からやり直しますか？')) commit(fresh()); }}>データをリセット</button></div>
       </>}
