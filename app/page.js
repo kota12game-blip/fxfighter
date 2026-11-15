@@ -7,6 +7,8 @@ import { isMarketOpen } from '../lib/market';
 import AdminPanel from './admin';
 
 const LEV = 25, SP = 0.01;
+const SYMS = { USDJPY: { label: 'USD/JPY', name: '米ドル／日本円', sp: 0.01 }, AUDJPY: { label: 'AUD/JPY', name: '豪ドル／日本円', sp: 0.012 } };
+const symOf = x => (x && x.sym) || 'USDJPY';
 const fresh = () => ({ bal: 1e6, pos: [], ord: [], hist: [], bonusDay: '', bonusTotal: 0, bonusCount: 0, start: Date.now(), id: 1, items: { own: [], guard: 0, ins: 0 }, guardOn: false, loan: null, insDay: '', vip: null, vipDay: '' });
 const yen = n => (n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
 const sgn = n => (n > 0 ? '+' : n < 0 ? '-' : '') + '¥' + Math.round(Math.abs(n)).toLocaleString('ja-JP');
@@ -30,7 +32,9 @@ export default function App() {
   const [user, setUser] = useState(undefined);
   const [profile, setProfile] = useState(null);
   const [S, setS] = useState(null);
-  const [candles, setCandles] = useState([]);
+  const [cdl, setCdl] = useState({});
+  const [sym, setSym] = useState('USDJPY');
+  const [multi, setMulti] = useState(false);
   const [err, setErr] = useState('');
   const [tab, setTab] = useState('home');
   const [tf, setTf] = useState(1);
@@ -80,10 +84,16 @@ export default function App() {
   const [gfeed, setGfeed] = useState([]);
   const [gmsg, setGmsg] = useState('');
   const [meta, setMeta] = useState({ interval: 120, mode: 'normal', left: null, lastOk: 0, fails: 0, lastErr: '' });
-  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cv = useRef(null), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0), annQ = useRef([]), annBusy = useRef(false), verRef = useRef(0), dirtyRef = useRef(false), savingRef = useRef(false), evtRef = useRef({ evt: 'tick', logs: [], id: null }), stateOk = useRef(false);
+  const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cvs = useRef({}), midsRef = useRef({}), wantAudRef = useRef(false), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0), annQ = useRef([]), annBusy = useRef(false), verRef = useRef(0), dirtyRef = useRef(false), savingRef = useRef(false), evtRef = useRef({ evt: 'tick', logs: [], id: null }), stateOk = useRef(false);
 
-  const mid = candles.length ? candles[candles.length - 1].c : 0;
-  const bid = mid - SP / 2, ask = mid + SP / 2;
+  // 通貨ペアごとの価格（sym＝いま表示中の通貨）
+  const lastC = k => { const c = cdl[k]; return c && c.length ? c[c.length - 1] : null; };
+  const priceOf = k => { const l = lastC(k); const m = l ? l.c : 0; const sp = (SYMS[k] || SYMS.USDJPY).sp; return { mid: m, bid: m - sp / 2, ask: m + sp / 2, sp }; };
+  const mids = { USDJPY: priceOf('USDJPY').mid, AUDJPY: priceOf('AUDJPY').mid };
+  midsRef.current = mids;
+  const cur = priceOf(sym);
+  const mid = cur.mid, bid = cur.bid, ask = cur.ask;
+  const candles = cdl[sym] || [];
   midRef.current = mid;
   nextRef.current = nextAt;
   // 端末の時計がずれていても動くよう、サーバー時刻との差(offRef)を使う
@@ -92,7 +102,14 @@ export default function App() {
   const jstDay = () => new Date(sNow() + 9 * 36e5).toISOString().slice(0, 10);
   const mktOpen = mOpen();
   // 価格が取得できない／15分以上更新されない場合は「取引を一時停止」
-  const feedDown = mktOpen && (!!err || (candles.length > 0 && sNow() - candles[candles.length - 1].t > 15 * 60000));
+  // 必要な通貨（表示中・マルチ表示・保有・注文中）の価格が取れていないか、古いときは取引を一時停止する
+  const needSyms = new Set([sym]);
+  if (multi) { needSyms.add('USDJPY'); needSyms.add('AUDJPY'); }
+  if (S) { S.pos.forEach(q => needSyms.add(symOf(q))); S.ord.forEach(o => needSyms.add(symOf(o))); }
+  const wantAud = needSyms.has('AUDJPY');
+  wantAudRef.current = wantAud;
+  const symStale = k => { const l = lastC(k); return l ? sNow() - l.t > 15 * 60000 : loaded.current; };
+  const feedDown = mktOpen && (!!err || [...needSyms].some(symStale));
   const blocked = !mktOpen || feedDown;
   const toast = m => { setMsg(m); setTimeout(() => setMsg(''), 2600); };
   const post = (text, pnl) => { if (user) supabase.from('feed').insert({ user_id: user.id, text, pnl: pnl ?? null }).then(() => {}); };
@@ -100,21 +117,22 @@ export default function App() {
   const showNextAnn = () => { const t = annQ.current.shift(); if (!t) { annBusy.current = false; setAnn(null); return; } annBusy.current = true; setAnn(t); setTimeout(showNextAnn, 4000); };
   const pushAnn = t => { if (annQ.current.length < 5) annQ.current.push(String(t).slice(0, 70)); if (!annBusy.current) showNextAnn(); };
   // 価格データがない・古い・市場休止のときは、新規注文も決済もできない
-  const guardTrade = () => {
-    if (!mid) { toast('価格データがありません。取得できるまでお待ちください'); return true; }
+  const guardTrade = (k = sym) => {
+    if (!priceOf(k).mid) { toast('価格データがありません。取得できるまでお待ちください'); return true; }
     if (!mOpen()) { toast('市場が閉まっています（週末は取引できません）'); return true; }
     if (feedDown) { toast('価格データを取得できないため、取引を一時停止しています'); return true; }
     return false;
   };
 
   const calcOf = (s, m) => {
+    const mk = k => (typeof m === 'number' ? m : (m && m[k]) || 0);
     let u = 0, mg = 0;
-    s.pos.forEach(p => { u += p.side === 'buy' ? (m - SP / 2 - p.entry) * p.units : (p.entry - (m + SP / 2)) * p.units; mg += p.units * p.entry / LEV; });
+    s.pos.forEach(p => { const k = symOf(p), mm = mk(k), sp = (SYMS[k] || SYMS.USDJPY).sp; mg += p.units * p.entry / LEV; if (!mm) return; u += p.side === 'buy' ? (mm - sp / 2 - p.entry) * p.units : (p.entry - (mm + sp / 2)) * p.units; });
     const eq = s.bal + u;
     const due = debtDue(s);
     return { u, mg, eq, due, nw: eq - due, free: eq - mg, lvl: mg > 0 ? eq / mg * 100 : null };
   };
-  const C = S && mid ? calcOf(S, mid) : { u: 0, mg: 0, eq: S ? S.bal : 0, due: 0, nw: S ? S.bal : 0, free: S ? S.bal : 0, lvl: null };
+  const C = S ? calcOf(S, mids) : { u: 0, mg: 0, eq: 0, due: 0, nw: 0, free: 0, lvl: null };
 
   // ===== データ保存（バージョン管理）：サーバーが日時とバージョンを管理し、古い端末からの上書きを拒否する =====
   const newId = () => (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2));
@@ -128,7 +146,7 @@ export default function App() {
     if (why !== 'pull') post('⚠️ 古い端末のデータ保存を検知。サーバーの最新データに置き換えました');
   };
   const afterSave = async (n, nw) => {
-    await supabase.from('public_positions').upsert({ user_id: user.id, pos: profRef.current?.share_pos === false ? [] : n.pos.map(q => ({ side: q.side, units: q.units, entry: q.entry })), updated_at: new Date().toISOString() });
+    await supabase.from('public_positions').upsert({ user_id: user.id, pos: profRef.current?.share_pos === false ? [] : n.pos.map(q => ({ side: q.side, units: q.units, entry: q.entry, sym: symOf(q) })), updated_at: new Date().toISOString() });
     await supabase.rpc('report_equity', { e: nw, base: verRef.current });
     await supabase.rpc('check_top3');
     const { data: gl } = await supabase.rpc('my_groups'); (gl || []).forEach(x => supabase.rpc('check_group_rank', { gid: x.id }).then(() => {}));
@@ -142,7 +160,7 @@ export default function App() {
         const n = Sref.current, ev = evtRef.current;
         evtRef.current = { evt: 'tick', logs: [], id: null };
         if (!ev.id) ev.id = newId();
-        const nw = calcOf(n, midRef.current || 155).nw;
+        const nw = calcOf(n, midsRef.current).nw;
         const { data, error } = await supabase.rpc('save_state', { p_data: n, p_base: verRef.current, p_event: ev.evt, p_event_id: ev.id, p_nw: nw, p_log: ev.logs.length ? ev.logs : null });
         if (error || !data) {
           const nx = evtRef.current;
@@ -216,12 +234,12 @@ export default function App() {
         if (loaded.current && !isMarketOpen(new Date(Date.now() + offRef.current))) { schedule(60000); return; }
         const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 15000);
         const t0 = Date.now();
-        const [r, tr] = await Promise.all([fetch('/api/candles', { signal: ctl.signal }), fetch('/api/time', { cache: 'no-store', signal: ctl.signal }).catch(() => null)]);
+        const [r, tr] = await Promise.all([fetch('/api/candles' + (wantAudRef.current ? '?aud=1' : ''), { signal: ctl.signal }), fetch('/api/time', { cache: 'no-store', signal: ctl.signal }).catch(() => null)]);
         const t1 = Date.now(); clearTimeout(to);
         try { if (tr && tr.ok) { const tj = await tr.json(); if (tj.t) offRef.current = tj.t - (t0 + t1) / 2; } } catch {}
         const j = await r.json();
-        if (j.candles) {
-          setCandles(j.candles); setNextAt(j.nextAt || null); setErr(''); loaded.current = true;
+        if (j.cdl || j.candles) {
+          setCdl(prev => ({ ...prev, ...(j.cdl || { USDJPY: j.candles }) })); setNextAt(j.nextAt || null); setErr(''); loaded.current = true;
           setMeta(m => ({ interval: j.intervalSec || m.interval, mode: j.mode || 'normal', left: j.left ?? null, lastOk: Date.now(), fails: 0, lastErr: '' }));
           schedule(j.nextAt ? Math.min(Math.max(3000, j.nextAt - (Date.now() + offRef.current) + 2000 + Math.random() * 3000), 6 * 60000) : (isMarketOpen(new Date(Date.now() + offRef.current)) ? 30000 : 600000));
         } else { const e = j.error || '価格取得エラー'; setErr(e); setMeta(m => ({ ...m, fails: m.fails + 1, lastErr: e })); schedule(15000); }
@@ -236,16 +254,19 @@ export default function App() {
     const dog = setInterval(() => { if (!busy && loaded.current && isMarketOpen(new Date(Date.now() + offRef.current)) && nextRef.current && Date.now() + offRef.current > nextRef.current + 20000) go(); }, 10000);
     return () => { dead = true; clearTimeout(timer); clearInterval(dog); document.removeEventListener('visibilitychange', wake); window.removeEventListener('online', wake); window.removeEventListener('focus', wake); window.removeEventListener('pageshow', wake); };
   }, []);
+  // 豪ドルが必要になったら、すぐに取り直す
+  useEffect(() => { if (loaded.current && goRef.current) goRef.current(); }, [wantAud]);
   // 指値約定・ロスカット判定（価格更新ごと）
   useEffect(() => {
-    const s = Sref.current; if (!s || !candles.length || feedDown) return;
+    const s = Sref.current; if (!s || feedDown || !Object.keys(cdl).length) return;
     const n = structuredClone(s); let ch = false;
     n.ord = n.ord.filter(o => {
-      const hit = candles.some(c => c.t >= o.t - 60000 && (o.side === 'buy' ? c.l + SP / 2 <= o.price : c.h - SP / 2 >= o.price));
-      if (hit) { n.pos.push({ id: n.id++, side: o.side, units: o.units, entry: o.price, t: Date.now() }); ch = true; toast('指値約定 @' + o.price.toFixed(3)); post('指値約定 ' + (o.side === 'buy' ? '買い ' : '売り ') + o.units.toLocaleString() + '通貨 @' + o.price.toFixed(3)); return false; }
+      const k = symOf(o), sp = SYMS[k].sp;
+      const hit = (cdl[k] || []).some(c => c.t >= o.t - 60000 && (o.side === 'buy' ? c.l + sp / 2 <= o.price : c.h - sp / 2 >= o.price));
+      if (hit) { n.pos.push({ id: n.id++, side: o.side, units: o.units, entry: o.price, t: Date.now(), sym: k }); ch = true; toast('指値約定 @' + o.price.toFixed(3)); post('指値約定 ' + (o.side === 'buy' ? '買い ' : '売り ') + o.units.toLocaleString() + '通貨 @' + o.price.toFixed(3)); return false; }
       return true;
     });
-    const c = calcOf(n, mid);
+    const c = calcOf(n, mids);
     if (c.lvl === null) { if (n.guardOn) { n.guardOn = false; ch = true; } }
     else {
       if (n.guardOn && c.lvl >= 50) { n.guardOn = false; ch = true; toast('ロスカット回避券の効果が終わりました'); }
@@ -255,7 +276,7 @@ export default function App() {
       }
     }
     if (ch) commit(n);
-  }, [candles]);
+  }, [cdl]);
   // ランキング
   useEffect(() => {
     if (tab !== 'rank' || !user) return;
@@ -263,11 +284,12 @@ export default function App() {
     go(); const i = setInterval(() => { if (!document.hidden) go(); }, 30000); return () => clearInterval(i);
   }, [tab, user]);
   // ランキングに載る自分の総資産は価格更新に合わせて保存
-  useEffect(() => { if (S && user && mid && stateOk.current) supabase.rpc('report_equity', { e: calcOf(Sref.current, mid).nw, base: verRef.current }).then(() => supabase.rpc('check_top3')); }, [mid]);
+  useEffect(() => { if (S && user && mids.USDJPY && stateOk.current) supabase.rpc('report_equity', { e: calcOf(Sref.current, mids).nw, base: verRef.current }).then(() => supabase.rpc('check_top3')); }, [mids.USDJPY, mids.AUDJPY]);
 
   function close(n, id, auto) {
     const i = n.pos.findIndex(p => p.id === id); if (i < 0) return;
-    const p = n.pos[i], ex = p.side === 'buy' ? bid : ask;
+    const p = n.pos[i], k = symOf(p), pr = priceOf(k); if (!pr.mid) return;
+    const ex = p.side === 'buy' ? pr.bid : pr.ask;
     let pl = p.side === 'buy' ? (ex - p.entry) * p.units : (p.entry - ex) * p.units;
     // 高級保険：契約中は、1日1回だけ、損失が3万円を超える決済を1万円に軽減する
     let vipSaved = 0;
@@ -275,7 +297,7 @@ export default function App() {
       vipSaved = -pl - 10000; pl = -10000; n.vipDay = jstDay();
       post('🛡 高級保険が発動！ 損失 ' + yen(10000 + vipSaved) + ' → ' + yen(10000) + ' に軽減');
     }
-    n.bal += pl; n.hist.unshift({ et: p.t, t: Date.now(), side: p.side, units: p.units, entry: p.entry, exit: ex, pnl: pl, auto: !!auto, vip: vipSaved });
+    n.bal += pl; n.hist.unshift({ et: p.t, t: Date.now(), side: p.side, units: p.units, entry: p.entry, exit: ex, pnl: pl, auto: !!auto, vip: vipSaved, sym: k });
     evtRef.current.logs.push({ kind: 'close', ...n.hist[0] });
     n.hist = n.hist.slice(0, 200); n.pos.splice(i, 1);
   }
@@ -286,12 +308,12 @@ export default function App() {
     if (otype === 'market') {
       const px = side === 'buy' ? ask : bid;
       if (qty * px / LEV > C.free) return toast('使用可能資金が足りません');
-      n.pos.push({ id: n.id++, side, units: qty, entry: px, t: Date.now() }); toast((side === 'buy' ? '買い' : '売り') + '約定 @' + px.toFixed(3)); post((side === 'buy' ? '買い ' : '売り ') + qty.toLocaleString() + '通貨 @' + px.toFixed(3));
+      n.pos.push({ id: n.id++, side, units: qty, entry: px, t: Date.now(), sym }); toast((side === 'buy' ? '買い' : '売り') + '約定 @' + px.toFixed(3)); post(SYMS[sym].label + ' ' + (side === 'buy' ? '買い ' : '売り ') + qty.toLocaleString() + '通貨 @' + px.toFixed(3));
     } else {
       const p = parseFloat(lp); if (!p) return toast('指値価格を入力してください');
       if ((side === 'buy' && p >= ask) || (side === 'sell' && p <= bid)) return toast(side === 'buy' ? '買い指値はAskより下に設定してください' : '売り指値はBidより上に設定してください');
       if (qty * p / LEV > C.free) return toast('使用可能資金が足りません');
-      n.ord.push({ id: n.id++, side, units: qty, price: p, t: Date.now() }); toast('指値注文を受け付けました');
+      n.ord.push({ id: n.id++, side, units: qty, price: p, t: Date.now(), sym }); toast('指値注文を受け付けました');
     }
     commit(n);
   }
@@ -303,7 +325,16 @@ export default function App() {
   };
 
   // ---- ヘルパー ----
-  const lcPx = st => { let net = 0, cst = 0, mg = 0; st.pos.forEach(q => { mg += q.units * q.entry / LEV; if (q.side === 'buy') { net += q.units; cst += (-SP / 2 - q.entry) * q.units; } else { net -= q.units; cst += (q.entry - SP / 2) * q.units; } }); return net ? ((st.guardOn ? 0.2 : 0.5) * mg - st.bal - cst) / net : null; };
+  // 強制ロスカット価格の目安（通貨kについて。ほかの通貨の損益は現在値のまま固定して計算）
+  const lcPx = (st, k = sym) => {
+    let net = 0, cst = 0, mg = 0, other = 0;
+    st.pos.forEach(q => {
+      const qk = symOf(q), sp = (SYMS[qk] || SYMS.USDJPY).sp; mg += q.units * q.entry / LEV;
+      if (qk !== k) { const mm = mids[qk]; if (mm) other += q.side === 'buy' ? (mm - sp / 2 - q.entry) * q.units : (q.entry - (mm + sp / 2)) * q.units; return; }
+      if (q.side === 'buy') { net += q.units; cst += (-sp / 2 - q.entry) * q.units; } else { net -= q.units; cst += (q.entry - sp / 2) * q.units; }
+    });
+    return net ? ((st.guardOn ? 0.2 : 0.5) * mg - st.bal - other - cst) / net : null;
+  };
   const loadGroups = async () => { const { data } = await supabase.rpc('my_groups'); const l = data || []; setGroups(l); setGsel(cur => (l.find(x => x.id === cur) ? cur : (l[0]?.id ?? null))); };
   const loadGBoard = async () => { if (!gsel) { setGboard([]); return; } const { data } = await supabase.rpc('group_board', { gid: gsel }); setGboard(data || []); supabase.rpc('check_group_rank', { gid: gsel }).then(() => {}); };
   const createGroup = async () => { const v = gn.trim(); if (!v) return toast('グループ名を入力してください'); const { error } = await supabase.rpc('create_group', { gname: v }); if (error) return toast('作成に失敗しました'); setGn(''); toast('グループを作りました'); loadGroups(); };
@@ -458,7 +489,7 @@ export default function App() {
     n.bal -= price; commit(n); toast('購入しました');
   };
   const equip = async (field, val) => { await supabase.from('profiles').update({ [field]: val }).eq('id', user.id); const np = { ...profile, [field]: val }; setProfile(np); profRef.current = np; };
-  const ppl = q => (q.side === 'buy' ? (bid - q.entry) : (q.entry - ask)) * q.units;
+  const ppl = q => { const pr = priceOf(symOf(q)); return (q.side === 'buy' ? (pr.bid - q.entry) : (q.entry - pr.ask)) * q.units; };
   const sendRequest = async () => {
     const { data, error } = await supabase.rpc('send_request', { msg: reqText });
     if (error || data !== 'ok') return toast(data === 'slow' ? '送信が多すぎます。少し待ってください' : '送れませんでした');
@@ -478,7 +509,7 @@ export default function App() {
   };
   useEffect(() => { if (tab !== 'rank' || rtab !== 'global' || !user) return; loadGlobal(); const i = setInterval(loadGlobal, 30000); return () => clearInterval(i); }, [tab, rtab, user, gmode]);
   const loadFeed = async () => { const { data } = await supabase.from('feed').select('id,user_id,text,pnl,created_at,profiles(name,title,icon),reactions(emoji,user_id)').order('created_at', { ascending: false }).limit(40); setFeed(data || []); const { data: ge } = await supabase.from('global_events').select('id,kind,text,created_at').order('created_at', { ascending: false }).limit(15); setGev(ge || []);
-    const { data: an } = await supabase.from('announcements').select('id,text,created_at').order('id', { ascending: false }).limit(5); setAnns(an || []); };
+    const { data: an } = await supabase.from('announcements').select('id,text,created_at').order('id', { ascending: false }).limit(2); setAnns(an || []); };
   const react = async (f, emoji) => {
     const mine = f.reactions.some(r => r.user_id === user.id && r.emoji === emoji);
     if (mine) await supabase.from('reactions').delete().match({ feed_id: f.id, user_id: user.id, emoji });
@@ -515,39 +546,41 @@ export default function App() {
     })();
     return () => { done = true; cancelAnimationFrame(raf); stream && stream.getTracks().forEach(t => t.stop()); };
   }, [scan]);
-  // チャート描画（ロスカットライン・取引マーカー付き）
-  useEffect(() => {
-    const el = cv.current; if (!el || tab !== 'market' || !candles.length) return;
+  // チャート描画（ロスカットライン・取引マーカー付き）。通貨kのキャンバスに描く
+  const drawChart = (el, k) => {
+    const cds = cdl[k]; if (!el || !cds || !cds.length) return;
+    const pr = priceOf(k);
     const r = window.devicePixelRatio || 1, w = el.clientWidth, h = el.clientHeight; el.width = w * r; el.height = h * r;
     const g = el.getContext('2d'); g.scale(r, r);
     const css = getComputedStyle(document.documentElement), up = css.getPropertyValue('--up'), dn = css.getPropertyValue('--dn'), ln = css.getPropertyValue('--line'), sb = css.getPropertyValue('--sub');
     const b = tf * 60000, m = new Map();
-    candles.forEach(c => { const k = Math.floor(c.t / b); const x = m.get(k); if (!x) m.set(k, { ...c, t: k * b }); else { x.h = Math.max(x.h, c.h); x.l = Math.min(x.l, c.l); x.c = c.c; } });
+    cds.forEach(c => { const kk = Math.floor(c.t / b); const x = m.get(kk); if (!x) m.set(kk, { ...c, t: kk * b }); else { x.h = Math.max(x.h, c.h); x.l = Math.min(x.l, c.l); x.c = c.c; } });
     const d = [...m.values()].slice(-42);
     let hi = Math.max(...d.map(c => c.h)), lo = Math.min(...d.map(c => c.l));
-    const lc = S ? lcPx(S) : null;
-    if (lc && Math.abs(lc - mid) < mid * 0.01) { hi = Math.max(hi, lc); lo = Math.min(lo, lc); }
+    const lc = S ? lcPx(S, k) : null;
+    if (lc && Math.abs(lc - pr.mid) < pr.mid * 0.01) { hi = Math.max(hi, lc); lo = Math.min(lo, lc); }
     const pad = (hi - lo) * .08 || .01; hi += pad; lo -= pad;
     const pw = 44, cw = (w - pw) / d.length, y = v => 6 + (hi - v) / (hi - lo) * (h - 12);
     g.font = '10px sans-serif'; g.lineWidth = 1;
     for (let i = 0; i < 4; i++) { const v = lo + (hi - lo) * i / 3, yy = y(v); g.strokeStyle = ln; g.beginPath(); g.moveTo(0, yy); g.lineTo(w - pw, yy); g.stroke(); g.fillStyle = sb; g.fillText(v.toFixed(3), w - pw + 4, yy + 3); }
     d.forEach((c, i) => { const x = i * cw + cw / 2, col = c.c >= c.o ? up : dn; g.strokeStyle = col; g.fillStyle = col; g.beginPath(); g.moveTo(x, y(c.h)); g.lineTo(x, y(c.l)); g.stroke(); g.fillRect(x - cw * .35, y(Math.max(c.o, c.c)), cw * .7, Math.max(1, Math.abs(y(c.o) - y(c.c)))); });
-    // 取引マーカー（▲買い ▼売り）
-    const idxOf = t => { let k = -1; d.forEach((c, i) => { if (c.t <= t) k = i; }); return k; };
+    // 取引マーカー（▲買い ▼売り）：この通貨の保有ポジションだけ
+    const idxOf = t => { let kk = -1; d.forEach((c, i) => { if (c.t <= t) kk = i; }); return kk; };
     if (S) {
-      const items = S.pos.map(q => ({ t: q.t, price: q.entry, side: q.side }));
-      items.forEach(it => { const i = idxOf(it.t); if (i < 0 || it.price > hi || it.price < lo) return; const x = i * cw + cw / 2, yy = y(it.price), buy = it.side === 'buy';
+      const mine = S.pos.filter(q => symOf(q) === k);
+      mine.forEach(it => { const i = idxOf(it.t); if (i < 0 || it.entry > hi || it.entry < lo) return; const x = i * cw + cw / 2, yy = y(it.entry), buy = it.side === 'buy';
         g.fillStyle = buy ? up : dn; g.strokeStyle = css.getPropertyValue('--ink'); g.lineWidth = 1.2; g.beginPath();
         if (buy) { g.moveTo(x, yy - 2); g.lineTo(x - 6, yy + 9); g.lineTo(x + 6, yy + 9); } else { g.moveTo(x, yy + 2); g.lineTo(x - 6, yy - 9); g.lineTo(x + 6, yy - 9); }
         g.closePath(); g.fill(); g.stroke(); });
-      // 建値ライン
       g.setLineDash([3, 3]); g.strokeStyle = sb; g.lineWidth = 1;
-      S.pos.forEach(q => { if (q.entry > lo && q.entry < hi) { g.beginPath(); g.moveTo(0, y(q.entry)); g.lineTo(w - pw, y(q.entry)); g.stroke(); } });
+      mine.forEach(q => { if (q.entry > lo && q.entry < hi) { g.beginPath(); g.moveTo(0, y(q.entry)); g.lineTo(w - pw, y(q.entry)); g.stroke(); } });
     }
-    // ロスカットライン
     if (lc && lc > lo && lc < hi) { g.setLineDash([6, 4]); g.strokeStyle = dn; g.lineWidth = 1.5; g.beginPath(); g.moveTo(0, y(lc)); g.lineTo(w - pw, y(lc)); g.stroke(); g.setLineDash([]); g.fillStyle = dn; g.fillText('ロスカット ' + lc.toFixed(3), 4, y(lc) - 4); }
     g.setLineDash([]);
-  }, [candles, tf, tab, S]);
+  };
+  useEffect(() => { if (tab !== 'market') return; Object.keys(SYMS).forEach(k => { if (cvs.current[k]) drawChart(cvs.current[k], k); }); }, [cdl, tf, tab, S, sym, multi]);
+  // マルチ為替はPC（幅900px以上）だけ
+  useEffect(() => { const f = () => { if (window.innerWidth < 900) setMulti(false); }; f(); window.addEventListener('resize', f); return () => window.removeEventListener('resize', f); }, []);
 
   if (user === undefined) return <main><p className="sm">読み込み中…</p></main>;
   const guest = async () => {
@@ -588,6 +621,22 @@ export default function App() {
   if (!S) return <main><p className="sm">データを読み込み中…</p></main>;
 
   const feedAll = [...feed, ...gev.map(e => ({ ...e, _g: true }))].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 50);
+  const chartCard = (k, compact) => {
+    const pr = priceOf(k), lc = S ? lcPx(S, k) : null, hasPos = S && S.pos.some(q => symOf(q) === k);
+    return (
+      <div className={'card' + (compact && k === sym ? ' chartsel' : '')} key={k} onClick={compact ? () => setSym(k) : undefined}>
+        <div className="sm">{SYMS[k].label}　{SYMS[k].name}</div>
+        <div className="big num">{pr.mid ? pr.mid.toFixed(3) : '—'}</div>
+        <div className="sm num">Bid {pr.bid.toFixed(3)} / Ask {pr.ask.toFixed(3)}　スプレッド{pr.sp.toFixed(3)}円</div>
+        {k === sym && mktOpen && cd && <div className="sm">次の更新まで {cd}（全端末が同時に更新されます）</div>}
+        {k === sym && !mktOpen && <div className="sm warn">市場休止中です（週末）。日本時間の月曜早朝に再開します。</div>}
+        {k === sym && feedDown && <div className="sm warn">価格を取得できないため、取引を一時停止しています。復旧すると自動で再開します。</div>}
+        <div className="seg">{[1, 5, 15].map(x => <button key={x} className={tf === x ? 'on' : ''} onClick={e => { e.stopPropagation(); setTf(x); }}>{x}分</button>)}</div>
+        <canvas ref={el => { cvs.current[k] = el; }} />
+        <div className="sm">▲買い ▼売り（保有中の建値。決済すると消えます）　赤い点線＝強制ロスカット価格の目安</div>
+        {hasPos && lc && <div className="sm warn num">強制ロスカット目安 {lc.toFixed(3)}（現在値との差 {Math.abs(pr.mid - lc).toFixed(2)}円）</div>}
+      </div>);
+  };
   const peerBox = id => peer[id] && <div className="sm" style={{ padding: '0 0 6px 10px' }}>{peer[id].length ? peer[id].map((q, j) => <div key={j} className="num">{q.side === 'buy' ? '買い' : '売り'} {q.units.toLocaleString()}通貨 @{q.entry.toFixed(3)}　<span className={cl(ppl(q))}>{sgn(ppl(q))}</span></div>) : '非公開、またはポジションなし'}</div>;
   const real = S.hist.reduce((a, h) => a + h.pnl, 0);
   const left = (() => { const e = new Date(S.start); e.setMonth(e.getMonth() + 6); return Math.max(0, Math.ceil((e - Date.now()) / 864e5)); })();
@@ -601,7 +650,7 @@ export default function App() {
   return (<>
     <header><b>VIRTUAL MARKET</b><button className="btn g" style={{ padding: '4px 10px', fontSize: 12 }} onClick={() => goRef.current && goRef.current()}>↻ 再取得</button></header>
     <div className="status">
-      {mid > 0 && <span className="pxbig num">{mid.toFixed(3)}</span>}
+      {mid > 0 && <><span className="sm">{SYMS[sym].label}</span><span className="pxbig num">{mid.toFixed(3)}</span></>}
       {newVer && <button className="btn" style={{ padding: '2px 10px', fontSize: 12 }} onClick={() => location.reload()}>🆕 新しいバージョン：再読み込み</button>}
       {!mktOpen ? <span>市場休止中（最終価格 {hhmm}）</span> : <>
         {(err || feedDown) && <span className="warn">⚠ {err ? '価格を取得できません：' + err + '（失敗' + meta.fails + '回）' : '価格が更新されていません'}・取引を一時停止中</span>}
@@ -622,17 +671,10 @@ export default function App() {
         <div className="card"><h2>遊び方</h2><button className="btn g" onClick={() => setTut(0)}>チュートリアルを見る</button></div>
       </>}
       {tab === 'market' && <div className="mk">
-        <div className="card"><div className="sm">USD/JPY　米ドル／日本円</div>
-          <div className="big num">{mid ? mid.toFixed(3) : '—'}</div>
-          <div className="sm num">Bid {bid.toFixed(3)} / Ask {ask.toFixed(3)}　スプレッド{SP.toFixed(2)}円</div>
-          {mktOpen && cd && <div className="sm">次の更新まで {cd}（全端末が同時に更新されます）</div>}
-          {!mktOpen && <div className="sm warn">市場休止中です（週末）。日本時間の月曜早朝に再開します。</div>}
-          {feedDown && <div className="sm warn">価格を取得できないため、取引を一時停止しています。復旧すると自動で再開します。</div>}
-          <div className="seg">{[1, 5, 15].map(k => <button key={k} className={tf === k ? 'on' : ''} onClick={() => setTf(k)}>{k}分</button>)}</div>
-          <canvas ref={cv} />
-          <div className="sm">▲買い ▼売り（保有中の建値。決済すると消えます）　赤い点線＝強制ロスカット価格の目安</div>
-          {S.pos.length > 0 && lcPx(S) && <div className="sm warn num">強制ロスカット目安 {lcPx(S).toFixed(3)}（現在値との差 {Math.abs(mid - lcPx(S)).toFixed(2)}円）</div>}</div>
+        <div className="seg symtabs">{Object.keys(SYMS).map(k => <button key={k} className={sym === k ? 'on' : ''} onClick={() => setSym(k)}>{SYMS[k].label}</button>)}<button className={'pc-only' + (multi ? ' on' : '')} onClick={() => setMulti(!multi)}>🖥 マルチ為替</button></div>
+        <div className={multi ? 'dual' : undefined}>{multi ? <>{chartCard('USDJPY', true)}{chartCard('AUDJPY', true)}</> : chartCard(sym, false)}</div>
         <div className="card">
+          <h2>{SYMS[sym].label} の注文</h2>
           <div className="seg">{[['market', '成行'], ['limit', '指値']].map(([k, l]) => <button key={k} className={otype === k ? 'on' : ''} onClick={() => setOtype(k)}>{l}</button>)}</div>
           <div className="sm">数量（通貨・1,000単位）</div><input type="number" inputMode="numeric" step="1000" value={qty} onChange={e => setQty(parseInt(e.target.value) || 0)} />
           {otype === 'limit' && <><div className="sm" style={{ marginTop: 8 }}>指値価格（円）</div><input type="number" inputMode="decimal" step="0.001" value={lp} onChange={e => setLp(e.target.value)} placeholder="例 155.000" /></>}
@@ -647,16 +689,16 @@ export default function App() {
           <div className="row"><span>使用可能資金</span><b className="num">{yen(C.free)}</b></div>
           <div className="row"><span>含み損益</span><b className={'num ' + cl(C.u)}>{sgn(C.u)}</b></div>
           <div className="row"><span>証拠金維持率</span><b className={'num ' + (C.lvl !== null && C.lvl < 100 ? 'warn' : '')}>{C.lvl === null ? '―' : C.lvl.toFixed(0) + '%'}</b></div>
-          <div className="row"><span>ロスカット価格（目安）</span><b className="num warn">{lcPx(S) ? lcPx(S).toFixed(3) : '―'}</b></div></div>
+          <div className="row"><span>ロスカット価格（目安・{SYMS[sym].label}）</span><b className="num warn">{lcPx(S) ? lcPx(S).toFixed(3) : '―'}</b></div></div>
         <h2>保有ポジション</h2>
-        {S.pos.length ? S.pos.map(p => { const pl = p.side === 'buy' ? (bid - p.entry) * p.units : (p.entry - ask) * p.units;
-          return <div className="card" key={p.id}><div className="row"><b>{p.side === 'buy' ? '買い' : '売り'} {p.units.toLocaleString()}通貨</b><b className={'num ' + cl(pl)}>{sgn(pl)}</b></div><div className="sm num">建値 {p.entry.toFixed(3)}</div>
-            <button className="btn g" style={{ marginTop: 8 }} onClick={() => { if (guardTrade()) return; const n = structuredClone(S); const b0 = n.bal; close(n, p.id); commit(n); post('決済 ' + (p.side === 'buy' ? '買い ' : '売り ') + p.units.toLocaleString() + '通貨', n.bal - b0); }}>決済する</button></div>; }) : <div className="card sm">ポジションはありません</div>}
+        {S.pos.length ? S.pos.map(p => { const pr = priceOf(symOf(p)); const pl = p.side === 'buy' ? (pr.bid - p.entry) * p.units : (p.entry - pr.ask) * p.units;
+          return <div className="card" key={p.id}><div className="row"><b>{SYMS[symOf(p)].label}　{p.side === 'buy' ? '買い' : '売り'} {p.units.toLocaleString()}通貨</b><b className={'num ' + cl(pl)}>{sgn(pl)}</b></div><div className="sm num">建値 {p.entry.toFixed(3)}</div>
+            <button className="btn g" style={{ marginTop: 8 }} onClick={() => { if (guardTrade(symOf(p))) return; const n = structuredClone(S); const b0 = n.bal; close(n, p.id); commit(n); post('決済 ' + (p.side === 'buy' ? '買い ' : '売り ') + p.units.toLocaleString() + '通貨', n.bal - b0); }}>決済する</button></div>; }) : <div className="card sm">ポジションはありません</div>}
         <h2>注文一覧</h2>
-        {S.ord.length ? S.ord.map(o => <div className="card" key={o.id}><div className="row"><span>{o.side === 'buy' ? '買い' : '売り'}指値 {o.units.toLocaleString()}通貨</span><b className="num">{o.price.toFixed(3)}</b></div>
+        {S.ord.length ? S.ord.map(o => <div className="card" key={o.id}><div className="row"><span>{SYMS[symOf(o)].label}　{o.side === 'buy' ? '買い' : '売り'}指値 {o.units.toLocaleString()}通貨</span><b className="num">{o.price.toFixed(3)}</b></div>
           <button className="btn g" onClick={() => { const n = structuredClone(S); n.ord = n.ord.filter(x => x.id !== o.id); commit(n); }}>取消</button></div>) : <div className="card sm">待機中の注文はありません</div>}
         <h2>取引履歴</h2>
-        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}{x.vip ? '（高級保険で軽減）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
+        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{SYMS[symOf(x)].label}　{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}{x.vip ? '（高級保険で軽減）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
       </>}
       {tab === 'rank' && <>
         <div className="seg">{[['rank', 'フレンド順位'], ['global', '全体順位'], ['feed', 'フィード'], ['group', 'グループ'], ['friend', 'フレンド']].map(([k, l]) => <button key={k} className={rtab === k ? 'on' : ''} onClick={() => setRtab(k)}>{l}</button>)}</div>
@@ -715,7 +757,7 @@ export default function App() {
           <h2 style={{ marginTop: 18 }}>フレンド一覧</h2>
           {board.filter(r => r.id !== user.id).length ? board.filter(r => r.id !== user.id).map(r => <div key={r.id}><div className="row"><span>{r.icon} {r.name}</span><span style={{ display: 'flex', gap: 6 }}>
               <button className="btn g" style={{ padding: '4px 10px' }} onClick={() => setSendTo(sendTo?.id === r.id ? null : r)}>送金</button>
-              <button className="btn g" style={{ padding: '4px 10px' }} onClick={() => removeFriend(r)}>削除</button></span></div>
+              {r.title !== 'ゲーム管理者' && <button className="btn g" style={{ padding: '4px 10px' }} onClick={() => removeFriend(r)}>削除</button>}</span></div>
               {sendTo?.id === r.id && <div style={{ padding: '4px 0 10px' }}>
                 <div className="sm" style={{ marginBottom: 4 }}>{r.name} さんに送る金額（1,000円〜100万円・使用可能 {yen(C.free)}）</div>
                 <input type="number" inputMode="numeric" value={amt} onChange={e => setAmt(e.target.value)} placeholder="金額（円）" />
