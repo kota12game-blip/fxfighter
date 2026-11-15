@@ -15,6 +15,7 @@ let meta = { interval: SLOT_SEC, mode: 'normal', left: null };
 let used = { day: '', n: 0 }; // DBが使えないときの予備カウント
 let lastFail = 0, lastMsg = '';
 const inflight = {};
+const symErr = {}; // 通貨ごとの直近のエラー（画面の「接続情報」に出す）
 
 const fail = msg => Response.json({ error: msg }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
 
@@ -33,10 +34,10 @@ async function refresh(syms, now, key) {
   let okN = 0, msg = null;
   for (const s of syms) {
     const o = syms.length === 1 ? j : j[TD[s]];
-    if (o && o.values) {
+    if (o && o.values && o.values.length) {
       const candles = o.values.map(v => ({ t: new Date(v.datetime.replace(' ', 'T') + 'Z').getTime(), o: +v.open, h: +v.high, l: +v.low, c: +v.close })).reverse();
-      mems[s] = { at: now, nextAt: 0, candles }; okN++;
-    } else if (!msg) msg = (o && o.message) || j.message || null;
+      mems[s] = { at: now, nextAt: 0, candles }; okN++; delete symErr[s];
+    } else { symErr[s] = (o && (o.message || o.status)) || j.message || '空のデータが返りました'; if (!msg) msg = symErr[s]; }
   }
   if (!okN) throw new Error(msg || '価格を取得できません');
   // API使用量：取得するたびにDBへ加算。DBが使えないときは、このサーバーでの回数から推定
@@ -77,12 +78,12 @@ export async function GET(req) {
   }
   const t = Date.now();
   const ready = want.filter(s => mems[s] && (open ? t < mems[s].nextAt : true));
-  if (!ready.includes('USDJPY')) return fail(lastMsg || '価格を取得できません');
+  if (!ready.length) return fail(lastMsg || '価格を取得できません');
   const missing = want.filter(s => !ready.includes(s));
   const nextAt = open ? Math.min(...ready.map(s => mems[s].nextAt)) : null;
   const maxAge = missing.length ? 15 : open ? Math.max(1, Math.ceil((nextAt - t) / 1000)) : 21600;
   const cdl = Object.fromEntries(ready.map(s => [s, mems[s].candles]));
   return Response.json(
-    { serverTime: t, cdl, candles: cdl.USDJPY, nextAt, intervalSec: meta.interval, mode: open ? meta.mode : 'closed', left: meta.left, missing },
+    { serverTime: t, cdl, candles: cdl.USDJPY || null, nextAt, intervalSec: meta.interval, mode: open ? meta.mode : 'closed', left: meta.left, missing, errors: Object.fromEntries(want.filter(s => symErr[s]).map(s => [s, symErr[s]])) },
     { headers: { 'Cache-Control': `public, s-maxage=${maxAge}, stale-while-revalidate=0` } });
 }
