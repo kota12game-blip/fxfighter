@@ -85,7 +85,7 @@ export default function App() {
   const [gview, setGview] = useState('rank');
   const [gfeed, setGfeed] = useState([]);
   const [gmsg, setGmsg] = useState('');
-  const [meta, setMeta] = useState({ interval: 120, mode: 'normal', left: null, lastOk: 0, fails: 0, lastErr: '' });
+  const [meta, setMeta] = useState({ interval: 120, mode: 'normal', left: null, lastOk: 0, fails: 0, lastErr: '', errs: {} });
   const Sref = useRef(null), midRef = useRef(0), timer = useRef(null), cvs = useRef({}), midsRef = useRef({}), wantAudRef = useRef(false), profRef = useRef(null), vid = useRef(null), loaded = useRef(false), goRef = useRef(null), nextRef = useRef(null), offRef = useRef(0), annQ = useRef([]), annBusy = useRef(false), verRef = useRef(0), dirtyRef = useRef(false), savingRef = useRef(false), evtRef = useRef({ evt: 'tick', logs: [], id: null }), stateOk = useRef(false);
 
   // 通貨ペアごとの価格（sym＝いま表示中の通貨）
@@ -242,7 +242,7 @@ export default function App() {
         const j = await r.json();
         if (j.cdl || j.candles) {
           setCdl(prev => ({ ...prev, ...(j.cdl || { USDJPY: j.candles }) })); setNextAt(j.nextAt || null); setErr(''); loaded.current = true;
-          setMeta(m => ({ interval: j.intervalSec || m.interval, mode: j.mode || 'normal', left: j.left ?? null, lastOk: Date.now(), fails: 0, lastErr: '' }));
+          setMeta(m => ({ interval: j.intervalSec || m.interval, mode: j.mode || 'normal', left: j.left ?? null, lastOk: Date.now(), fails: 0, lastErr: '', errs: j.errors || {} }));
           schedule(j.nextAt ? Math.min(Math.max(3000, j.nextAt - (Date.now() + offRef.current) + 2000 + Math.random() * 3000), 6 * 60000) : (isMarketOpen(new Date(Date.now() + offRef.current)) ? 30000 : 600000));
         } else { const e = j.error || '価格取得エラー'; setErr(e); setMeta(m => ({ ...m, fails: m.fails + 1, lastErr: e })); schedule(15000); }
       } catch (e) { setErr('通信できません'); setMeta(m => ({ ...m, fails: m.fails + 1, lastErr: '通信できません' })); schedule(15000); }
@@ -870,6 +870,7 @@ export default function App() {
           <div className="row"><span>連続失敗</span><b className="num">{meta.fails}回</b></div>
           <div className="row"><span>直近のエラー</span><b className="sm">{err || meta.lastErr || 'なし'}</b></div>
           <div className="row"><span>端末の時計のずれ</span><b className="num">{(offRef.current / 1000).toFixed(1)}秒</b></div>
+          {Object.keys(SYMS).map(k => <div className="row" key={k}><span>{SYMS[k].label}</span><b className="sm">{lastC(k) ? '最終 ' + new Date(lastC(k).t).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }) : 'データなし'}{meta.errs && meta.errs[k] ? ' ／ ' + meta.errs[k] : ''}</b></div>)}
           <button className="btn g" style={{ marginTop: 8 }} onClick={() => goRef.current && goRef.current()}>↻ 今すぐ再取得</button></div>
         <div className="card"><h2>プライバシー</h2><div className="sm" style={{ marginBottom: 8 }}>フレンドに保有ポジションを見せる：<b>{profile?.share_pos === false ? 'オフ' : 'オン'}</b></div>
           <button className="btn g" onClick={async () => { const v = profile?.share_pos === false; await supabase.from('profiles').update({ share_pos: v }).eq('id', user.id); const np = { ...profile, share_pos: v }; setProfile(np); profRef.current = np; commit(S, 'tick'); toast(v ? 'ポジションを公開します' : 'ポジションを非公開にしました'); }}>切り替える</button></div>
