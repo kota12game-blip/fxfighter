@@ -11,6 +11,9 @@ export default function AdminPanel({ supabase, toast, yen }) {
   const [view, setView] = useState(null);
   const [bks, setBks] = useState([]);
   const [text, setText] = useState('');
+  const [say, setSay] = useState('');
+  const [amt, setAmt] = useState('');
+  const [note, setNote] = useState('');
 
   const load = async () => {
     await supabase.rpc('admin_friend_all');
@@ -45,6 +48,18 @@ export default function AdminPanel({ supabase, toast, yen }) {
     const { data } = await supabase.rpc('admin_post_update', { msg: text.trim() });
     toast(data === 'ok' ? 'お知らせを投稿しました' : '失敗しました：' + data); if (data === 'ok') setText('');
   };
+  const sayAll = async () => {
+    if (!say.trim()) return;
+    const { data } = await supabase.rpc('admin_say', { msg: say.trim() });
+    toast(data === 'ok' ? '全体フィードに投稿しました' : '失敗しました：' + data); if (data === 'ok') setSay('');
+  };
+  const sendMoney = async () => {
+    const a = Math.floor(Number(amt));
+    if (!(a >= 1)) return toast('金額を入力してください');
+    if (!confirm((sel?.name || '') + ' さんに ' + a.toLocaleString() + '円を送金します。よろしいですか？')) return;
+    const { data } = await supabase.rpc('admin_send', { uid: sel.id, amt: a, note });
+    toast(data === 'ok' ? '送金しました（相手が開くと届きます）' : '失敗しました：' + data); if (data === 'ok') { setAmt(''); setNote(''); }
+  };
   const season = async full => {
     if (!confirm(full ? 'シーズンをリセットします（全員の資金を100万円に戻し、保存ログも全削除）。よろしいですか？' : '保存ログ（バックアップ・取引履歴・整合性ログ）を全削除します。よろしいですか？')) return;
     if (full && !confirm('本当に全員の資金を初期化しますか？')) return;
@@ -61,6 +76,10 @@ export default function AdminPanel({ supabase, toast, yen }) {
       <h2 style={{ marginTop: 12 }}>お知らせを書く（全員に表示）</h2>
       <input value={text} onChange={e => setText(e.target.value)} placeholder="アップデート内容など" maxLength={200} />
       <button className="btn" style={{ marginTop: 8 }} onClick={postUpdate}>投稿する</button>
+
+      <h2 style={{ marginTop: 16 }}>全体フィードに一言</h2>
+      <input value={say} onChange={e => setSay(e.target.value)} placeholder="例：メンテナンスします（100文字まで）" maxLength={100} />
+      <button className="btn" style={{ marginTop: 8 }} onClick={sayAll}>投稿する</button>
 
       <h2 style={{ marginTop: 16 }}>ユーザー一覧（{users.length}人）</h2>
       {users.map(u => (
@@ -87,6 +106,10 @@ export default function AdminPanel({ supabase, toast, yen }) {
         {bks.length ? bks.map(b => (
           <div className="row" key={b.id}><span className="sm">{fmt(b.saved_at)}　v{b.version}　{b.event}<br />現金 {yen(b.cash)}・ポジション{b.pos_count}件</span><button className="btn g" style={{ padding: '4px 10px' }} onClick={() => restore(b)}>復元</button></div>
         )) : <div className="sm">バックアップはありません</div>}
+        <h2 style={{ marginTop: 12 }}>送金（全体フィードの「運営の操作」に記録）</h2>
+        <input type="number" inputMode="numeric" value={amt} onChange={e => setAmt(e.target.value)} placeholder="金額（円）" />
+        <input style={{ marginTop: 6 }} value={note} onChange={e => setNote(e.target.value)} placeholder="一言（任意・30文字まで）" maxLength={30} />
+        <button className="btn" style={{ marginTop: 8 }} onClick={sendMoney}>送金する</button>
         <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
           <button className="btn g" onClick={wipe}>データを初期化</button>
           <button className="btn g" onClick={del} style={{ color: 'var(--dn)' }}>アカウントを削除</button>
