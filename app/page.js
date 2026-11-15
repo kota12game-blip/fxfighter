@@ -450,10 +450,22 @@ export default function App() {
     const { data } = await supabase.rpc('macro_cancel', { mid: id });
     await reloadFromServer(); toast(data === 'ok' ? '解除しました' : '解除できませんでした');
   };
+  // 決済価格を入れたときの利益の目安：ポジション（成行）は「現在から」と「建値からの合計」、指値注文は「約定から決済まで」
+  const macroProfit = (kind, it, pxv) => {
+    if (!pxv) return null;
+    const buy = it.side === 'buy', pr = priceOf(symOf(it));
+    if (kind === 'ord') return { total: (buy ? pxv - it.price : it.price - pxv) * it.units };
+    const now = buy ? pr.bid : pr.ask;
+    return { fromNow: (buy ? pxv - now : now - pxv) * it.units, total: (buy ? pxv - it.entry : it.entry - pxv) * it.units };
+  };
   const macroBox = (kind, it) => {
     const mc = macros.find(x => x.kind === kind && x.ref === it.id), key = (kind === 'pos' ? 'p' : 'o') + it.id;
-    if (mc) return <div className="sm" style={{ marginTop: 8 }}>🤖 自動決済券：{Number(mc.exit_price).toFixed(3)} {it.side === 'buy' ? '以上' : '以下'}で決済（残り{Math.max(0, Math.ceil((new Date(mc.expires_at) - nowMs) / 60000))}分）{kind === 'ord' ? '※約定後に有効' : ''} <button className="btn g" style={{ padding: '2px 8px', fontSize: 12 }} onClick={() => cancelMacro(mc.id)}>解除</button></div>;
-    return <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}><input style={{ flex: 1, minWidth: 120 }} type="number" inputMode="decimal" step="0.001" value={mcPrice[key] || ''} onChange={e => setMcPrice({ ...mcPrice, [key]: e.target.value })} placeholder={it.side === 'buy' ? '売る価格（これ以上で）' : '買い戻す価格（これ以下で）'} /><button className="btn g" onClick={() => buyMacro(kind, it.id)}>🤖 自動決済券 ¥1,000</button></div>;
+    const pf = macroProfit(kind, it, mc ? Number(mc.exit_price) : parseFloat(mcPrice[key]));
+    const profitLine = pf && <div className="sm num" style={{ marginTop: 4 }}>{kind === 'ord'
+      ? <>約定（指値 {it.price.toFixed(3)}）から決済までの利益：<b className={cl(pf.total)}>{sgn(pf.total)}</b></>
+      : <>現在から決済までの利益：<b className={cl(pf.fromNow)}>{sgn(pf.fromNow)}</b>　（建値からの合計：<b className={cl(pf.total)}>{sgn(pf.total)}</b>）</>}</div>;
+    if (mc) return <div className="sm" style={{ marginTop: 8 }}>🤖 自動決済券：{Number(mc.exit_price).toFixed(3)} {it.side === 'buy' ? '以上' : '以下'}で決済（残り{Math.max(0, Math.ceil((new Date(mc.expires_at) - nowMs) / 60000))}分）{kind === 'ord' ? '※約定後に有効' : ''} <button className="btn g" style={{ padding: '2px 8px', fontSize: 12 }} onClick={() => cancelMacro(mc.id)}>解除</button>{profitLine}</div>;
+    return <div style={{ marginTop: 8 }}><div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}><input style={{ flex: 1, minWidth: 120 }} type="number" inputMode="decimal" step="0.001" value={mcPrice[key] || ''} onChange={e => setMcPrice({ ...mcPrice, [key]: e.target.value })} placeholder={it.side === 'buy' ? '売る価格（これ以上で）' : '買い戻す価格（これ以下で）'} /><button className="btn g" onClick={() => buyMacro(kind, it.id)}>🤖 自動決済券 ¥1,000</button></div>{profitLine}</div>;
   };
   const contractVip = () => {
     if (S.vip && S.vip.on) return;
@@ -799,6 +811,11 @@ export default function App() {
       {tab === 'shop' && <>
         <button className="btn g" style={{ marginBottom: 12 }} onClick={() => setTab('home')}>← ホームに戻る</button>
         <div className="card"><div className="sm">使えるお金（使用可能資金）</div><div className="big num">{yen(C.free)}</div><div className="sm">買い物をすると総資産が減り、ランキングの順位も下がります。</div></div>
+        <div className="card"><h2>🤖 自動決済入金券　{yen(1000)}</h2>
+          <div className="sm" style={{ marginBottom: 8 }}>決済する価格を決めておくと、端末を閉じていても、サーバーが自動で決済します。効果は購入から6時間です。買いは「指定価格以上」、売りは「指定価格以下」で決済します。<br />指値注文に付けると、指値の価格で約定したあと、決済価格を待ちます（6時間以内に約定しないと、注文ごとキャンセル）。</div>
+          {S.pos.map(p => <div key={'mp' + p.id} className="row" style={{ display: 'block' }}><b>{SYMS[symOf(p)].label}　{p.side === 'buy' ? '買い' : '売り'} {p.units.toLocaleString()}通貨（建値 {p.entry.toFixed(3)}）</b>{macroBox('pos', p)}</div>)}
+          {S.ord.map(o => <div key={'mo' + o.id} className="row" style={{ display: 'block' }}><b>{SYMS[symOf(o)].label}　{o.side === 'buy' ? '買い' : '売り'}指値 {o.units.toLocaleString()}通貨（指値 {o.price.toFixed(3)}）</b>{macroBox('ord', o)}</div>)}
+          {!S.pos.length && !S.ord.length && <div className="sm">券を付けられるポジションや指値注文がありません。「市場」から注文すると、ここに出ます。</div>}</div>
         <div className="card"><h2>🏦 銀行（借金）</h2>
           <div className="sm" style={{ marginBottom: 8 }}>最大100万円まで・同時に1件。借りてから10日以内に返せば元本のまま。以後10日ごとに元本の50%が上乗せされます（11〜20日は150%、21〜30日は200%…）。借りるときに、借りる金額の1%が手数料としてかかります。借金は総資産から引かれます。</div>
           {S.loan ? <>
