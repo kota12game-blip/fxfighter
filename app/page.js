@@ -74,6 +74,8 @@ export default function App() {
   const [gme, setGme] = useState(null);
   const [gev, setGev] = useState([]);
   const [loadErr, setLoadErr] = useState(false);
+  const [macros, setMacros] = useState([]);
+  const [mcPrice, setMcPrice] = useState({});
   const [isAdmin, setIsAdmin] = useState(false);
   const [anns, setAnns] = useState([]);
   const [reqText, setReqText] = useState('');
@@ -261,6 +263,7 @@ export default function App() {
     const s = Sref.current; if (!s || feedDown || !Object.keys(cdl).length) return;
     const n = structuredClone(s); let ch = false;
     n.ord = n.ord.filter(o => {
+      if (o.macro) return true; // 自動決済券つきの指値は、サーバーが約定させる
       const k = symOf(o), sp = SYMS[k].sp;
       const hit = (cdl[k] || []).some(c => c.t >= o.t - 60000 && (o.side === 'buy' ? c.l + sp / 2 <= o.price : c.h - sp / 2 >= o.price));
       if (hit) { n.pos.push({ id: n.id++, side: o.side, units: o.units, entry: o.price, t: Date.now(), sym: k }); ch = true; toast('指値約定 @' + o.price.toFixed(3)); post('指値約定 ' + (o.side === 'buy' ? '買い ' : '売り ') + o.units.toLocaleString() + '通貨 @' + o.price.toFixed(3)); return false; }
@@ -425,6 +428,33 @@ export default function App() {
     await claimTransfers();
   };
   useEffect(() => { if (tab === 'rank' && rtab === 'friend' && user) loadTransfers(); }, [tab, rtab, user]);
+  // ===== 自動決済入金券（マクロ）：購入・解除はサーバーで処理し、結果を読み込み直す =====
+  const loadMacros = async () => { const { data } = await supabase.from('macros').select('id,kind,ref,sym,exit_price,expires_at,status').eq('status', 'active'); setMacros(data || []); };
+  useEffect(() => { if (!user || tab !== 'assets') return; loadMacros(); const i = setInterval(() => { if (!document.hidden) loadMacros(); }, 30000); return () => clearInterval(i); }, [user, tab]);
+  const reloadFromServer = async () => { const { data: ls } = await supabase.rpc('load_state'); if (ls) adopt(ls, 'pull'); await loadMacros(); };
+  const buyMacro = async (kind, ref) => {
+    const px = parseFloat(mcPrice[(kind === 'pos' ? 'p' : 'o') + ref]);
+    if (!px) return toast('決済する価格を入力してください');
+    if (C.free < 1000) return toast('使用可能資金が足りません');
+    await flush();
+    for (let i = 0; i < 20 && (savingRef.current || dirtyRef.current); i++) await new Promise(r => setTimeout(r, 250));
+    const { data, error } = await supabase.rpc('macro_buy', { p_kind: kind, p_ref: ref, p_exit: px });
+    if (error || !data) return toast('購入できませんでした（SQLの設定を確認してください）');
+    const msg = { badprice: '買いは建値（注文価格）より高く、売りは低い価格にしてください', already: 'すでに券が付いています', nocash: '資金が足りません', notfound: '対象が見つかりません。少し待ってからもう一度', nodata: 'データが保存されていません' }[data.status];
+    if (data.status !== 'ok') return toast(msg || '購入できませんでした');
+    await reloadFromServer(); toast('自動決済券を購入しました（約2〜3分ごとにチェックします）');
+  };
+  const cancelMacro = async id => {
+    if (!confirm('券を解除します。支払った1,000円は戻りません。よろしいですか？')) return;
+    await flush();
+    const { data } = await supabase.rpc('macro_cancel', { mid: id });
+    await reloadFromServer(); toast(data === 'ok' ? '解除しました' : '解除できませんでした');
+  };
+  const macroBox = (kind, it) => {
+    const mc = macros.find(x => x.kind === kind && x.ref === it.id), key = (kind === 'pos' ? 'p' : 'o') + it.id;
+    if (mc) return <div className="sm" style={{ marginTop: 8 }}>🤖 自動決済券：{Number(mc.exit_price).toFixed(3)} {it.side === 'buy' ? '以上' : '以下'}で決済（残り{Math.max(0, Math.ceil((new Date(mc.expires_at) - nowMs) / 60000))}分）{kind === 'ord' ? '※約定後に有効' : ''} <button className="btn g" style={{ padding: '2px 8px', fontSize: 12 }} onClick={() => cancelMacro(mc.id)}>解除</button></div>;
+    return <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}><input style={{ flex: 1, minWidth: 120 }} type="number" inputMode="decimal" step="0.001" value={mcPrice[key] || ''} onChange={e => setMcPrice({ ...mcPrice, [key]: e.target.value })} placeholder={it.side === 'buy' ? '売る価格（これ以上で）' : '買い戻す価格（これ以下で）'} /><button className="btn g" onClick={() => buyMacro(kind, it.id)}>🤖 自動決済券 ¥1,000</button></div>;
+  };
   const contractVip = () => {
     if (S.vip && S.vip.on) return;
     if (C.free < 2000) return toast('使用可能資金が足りません');
@@ -693,12 +723,12 @@ export default function App() {
         <h2>保有ポジション</h2>
         {S.pos.length ? S.pos.map(p => { const pr = priceOf(symOf(p)); const pl = p.side === 'buy' ? (pr.bid - p.entry) * p.units : (p.entry - pr.ask) * p.units;
           return <div className="card" key={p.id}><div className="row"><b>{SYMS[symOf(p)].label}　{p.side === 'buy' ? '買い' : '売り'} {p.units.toLocaleString()}通貨</b><b className={'num ' + cl(pl)}>{sgn(pl)}</b></div><div className="sm num">建値 {p.entry.toFixed(3)}</div>
-            <button className="btn g" style={{ marginTop: 8 }} onClick={() => { if (guardTrade(symOf(p))) return; const n = structuredClone(S); const b0 = n.bal; close(n, p.id); commit(n); post('決済 ' + (p.side === 'buy' ? '買い ' : '売り ') + p.units.toLocaleString() + '通貨', n.bal - b0); }}>決済する</button></div>; }) : <div className="card sm">ポジションはありません</div>}
+            <button className="btn g" style={{ marginTop: 8 }} onClick={() => { if (guardTrade(symOf(p))) return; const n = structuredClone(S); const b0 = n.bal; close(n, p.id); commit(n); post('決済 ' + (p.side === 'buy' ? '買い ' : '売り ') + p.units.toLocaleString() + '通貨', n.bal - b0); }}>決済する</button>{macroBox('pos', p)}</div>; }) : <div className="card sm">ポジションはありません</div>}
         <h2>注文一覧</h2>
         {S.ord.length ? S.ord.map(o => <div className="card" key={o.id}><div className="row"><span>{SYMS[symOf(o)].label}　{o.side === 'buy' ? '買い' : '売り'}指値 {o.units.toLocaleString()}通貨</span><b className="num">{o.price.toFixed(3)}</b></div>
-          <button className="btn g" onClick={() => { const n = structuredClone(S); n.ord = n.ord.filter(x => x.id !== o.id); commit(n); }}>取消</button></div>) : <div className="card sm">待機中の注文はありません</div>}
+          <button className="btn g" onClick={() => { if (o.macro) return toast('自動決済券が付いている注文です。先に券を解除してください'); const n = structuredClone(S); n.ord = n.ord.filter(x => x.id !== o.id); commit(n); }}>取消</button>{macroBox('ord', o)}</div>) : <div className="card sm">待機中の注文はありません</div>}
         <h2>取引履歴</h2>
-        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{SYMS[symOf(x)].label}　{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}{x.vip ? '（高級保険で軽減）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
+        <div className="card">{S.items.ins > 0 && S.hist[0] && !S.hist[0].void && S.hist[0].pnl < 0 && S.hist[0].pnl >= -1500 && <button className="btn" style={{ marginBottom: 10 }} onClick={useIns}>🧾 保険券を使う（直近の損失 {yen(-S.hist[0].pnl)} を取消）</button>}{S.hist.length ? S.hist.slice(0, 30).map((x, i) => <div className="row" key={i}><span className="sm">{new Date(x.t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}<br />{SYMS[symOf(x)].label}　{x.side === 'buy' ? '買い' : '売り'} {x.units.toLocaleString()}{x.auto ? '（ロスカット）' : ''}{x.void ? '（保険で取消）' : ''}{x.vip ? '（高級保険で軽減）' : ''}{x.macro ? '（自動決済券）' : ''}<br />{x.entry.toFixed(3)} → {x.exit.toFixed(3)}</span><b className={'num ' + cl(x.pnl)}>{sgn(x.pnl)}</b></div>) : <span className="sm">まだありません</span>}</div>
       </>}
       {tab === 'rank' && <>
         <div className="seg">{[['rank', 'フレンド順位'], ['global', '全体順位'], ['feed', 'フィード'], ['group', 'グループ'], ['friend', 'フレンド']].map(([k, l]) => <button key={k} className={rtab === k ? 'on' : ''} onClick={() => setRtab(k)}>{l}</button>)}</div>
