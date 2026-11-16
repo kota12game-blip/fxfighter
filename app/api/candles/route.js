@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { isMarketOpen, SLOT_SEC, SLOW_SEC } from '../../../lib/market';
+import { isMarketOpen, SLOT_SEC, SLOW_SEC, SLOW_BELOW } from '../../../lib/market';
 
 // Twelve Dataの1分足を取得（USD/JPY は常に、AUD/JPY は ?aud=1 のときだけ）。
 // ・更新は「区切り」に揃える（全端末が同じタイミングで同じ価格になる）
@@ -11,7 +11,7 @@ export const dynamic = 'force-dynamic';
 const CLOSED_TTL = 6 * 3600 * 1000, PLAN_LIMIT = 800;
 const TD = { USDJPY: 'USD/JPY', AUDJPY: 'AUD/JPY' };
 const mems = {}; // { USDJPY: { at, nextAt, candles }, AUDJPY: {...} }
-let meta = { interval: SLOT_SEC, mode: 'normal', left: null };
+let meta = { interval: SLOT_SEC, mode: 'normal', left: null, manual: null };
 let used = { day: '', n: 0 }; // DBが使えないときの予備カウント
 let lastFail = 0, lastMsg = '';
 const inflight = {};
@@ -19,12 +19,12 @@ const symErr = {}; // 通貨ごとの直近のエラー（画面の「接続情�
 
 const fail = msg => Response.json({ error: msg }, { status: 502, headers: { 'Cache-Control': 'no-store' } });
 
-// 残りクレジットで、今日の終わりまで通常ペースを保てるか（取得する通貨の数ぶん消費する）
-function pickInterval(left, now, pairs) {
+// 更新間隔の決め方：管理者の手動指定があればそれを優先。なければ、APIの残りが SLOW_BELOW 未満のときだけ節約（5分）
+function pickInterval(left, manualMode) {
+  if (manualMode === 'slow') return SLOW_SEC;
+  if (manualMode === 'normal') return SLOT_SEC;
   if (left == null) return SLOT_SEC;
-  const d = new Date(now), end = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
-  const need = (end - now) / 1000 / SLOT_SEC * pairs;
-  return left >= need * 1.1 ? SLOT_SEC : SLOW_SEC;
+  return left < SLOW_BELOW ? SLOW_SEC : SLOT_SEC;
 }
 
 async function refresh(syms, now, key) {
@@ -53,10 +53,17 @@ async function refresh(syms, now, key) {
     used.n += okN; usedToday = used.n;
   }
   const left = Math.max(0, PLAN_LIMIT - usedToday);
-  const interval = pickInterval(left, now, syms.length);
+  // 管理者が手動で切り替えているか（1時間で自動判定に戻る）
+  let ov = null;
+  try {
+    const sb2 = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+    const { data } = await sb2.rpc('get_fetch_override');
+    if (data && data.mode) ov = data;
+  } catch {}
+  const interval = pickInterval(left, ov && ov.mode);
   const nextAt = (Math.floor(now / (interval * 1000)) + 1) * interval * 1000;
   for (const s of syms) if (mems[s] && mems[s].at === now) mems[s].nextAt = nextAt;
-  meta = { interval, mode: interval === SLOT_SEC ? 'normal' : 'slow', left };
+  meta = { interval, mode: interval === SLOT_SEC ? 'normal' : 'slow', left, manual: ov ? { mode: ov.mode, until: ov.until } : null };
   if (okN < syms.length) lastMsg = msg || '';
 }
 
@@ -84,6 +91,6 @@ export async function GET(req) {
   const maxAge = missing.length ? 15 : open ? Math.max(1, Math.ceil((nextAt - t) / 1000)) : 21600;
   const cdl = Object.fromEntries(ready.map(s => [s, mems[s].candles]));
   return Response.json(
-    { serverTime: t, cdl, candles: cdl.USDJPY || null, nextAt, intervalSec: meta.interval, mode: open ? meta.mode : 'closed', left: meta.left, missing, errors: Object.fromEntries(want.filter(s => symErr[s]).map(s => [s, symErr[s]])) },
+    { serverTime: t, cdl, candles: cdl.USDJPY || null, nextAt, intervalSec: meta.interval, mode: open ? meta.mode : 'closed', left: meta.left, manual: open ? meta.manual : null, missing, errors: Object.fromEntries(want.filter(s => symErr[s]).map(s => [s, symErr[s]])) },
     { headers: { 'Cache-Control': `public, s-maxage=${maxAge}, stale-while-revalidate=0` } });
 }
