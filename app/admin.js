@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 const fmt = t => (t ? new Date(t).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '―');
 
 // 管理者パネル（管理者アカウントにだけ表示される。実際の権限チェックはサーバー側で行う）
-export default function AdminPanel({ supabase, toast, yen }) {
+export default function AdminPanel({ supabase, toast, yen, meta }) {
   const [open, setOpen] = useState(false);
   const [users, setUsers] = useState([]);
   const [sel, setSel] = useState(null);
@@ -60,6 +60,10 @@ export default function AdminPanel({ supabase, toast, yen }) {
     const { data } = await supabase.rpc('admin_send', { uid: sel.id, amt: a, note });
     toast(data === 'ok' ? '送金しました（相手が開くと届きます）' : '失敗しました：' + data); if (data === 'ok') { setAmt(''); setNote(''); }
   };
+  const setMode = async m => {
+    const { data } = await supabase.rpc('admin_set_fetch_mode', { m });
+    toast(data === 'ok' ? (m === 'auto' ? '自動判定に戻しました' : '切り替えました（次の更新の区切りから反映。1時間後に自動判定へ戻ります）') : '失敗しました：' + data);
+  };
   const season = async full => {
     if (!confirm(full ? 'シーズンをリセットします（全員の資金を100万円に戻し、保存ログも全削除）。よろしいですか？' : '保存ログ（バックアップ・取引履歴・整合性ログ）を全削除します。よろしいですか？')) return;
     if (full && !confirm('本当に全員の資金を初期化しますか？')) return;
@@ -73,7 +77,15 @@ export default function AdminPanel({ supabase, toast, yen }) {
     <div className="card">
       <div className="row" style={{ border: 0 }}><h2 style={{ margin: 0 }}>🛠 管理者パネル</h2><button className="btn g" style={{ padding: '4px 10px' }} onClick={() => setOpen(false)}>閉じる</button></div>
 
-      <h2 style={{ marginTop: 12 }}>お知らせを書く（全員に表示）</h2>
+      <h2 style={{ marginTop: 12 }}>価格の更新モード</h2>
+      <div className="sm" style={{ marginBottom: 6 }}>現在：{meta ? meta.interval / 60 : '―'}分（{meta && meta.mode === 'slow' ? '節約' : '通常'}）・{meta && meta.manual ? '手動（' + new Date(meta.manual.until).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }) + 'まで）' : '自動判定（APIの残りが400未満で節約）'}　API残り：{meta && meta.left != null ? meta.left : '―'}</div>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn g" onClick={() => setMode('normal')}>通常（2分）にする</button>
+        <button className="btn g" onClick={() => setMode('slow')}>節約（5分）にする</button>
+        <button className="btn g" onClick={() => setMode('auto')}>自動判定に戻す</button>
+      </div>
+
+      <h2 style={{ marginTop: 16 }}>お知らせを書く（全員に表示）</h2>
       <input value={text} onChange={e => setText(e.target.value)} placeholder="アップデート内容など" maxLength={200} />
       <button className="btn" style={{ marginTop: 8 }} onClick={postUpdate}>投稿する</button>
 
